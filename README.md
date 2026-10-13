@@ -1,97 +1,113 @@
 # 💧 Water Reminder
 
-An animated hydration buddy for **Windows, macOS and Linux**. Every 30 minutes, a water drop swims onto your screen holding a glass of water, and a wave rises along the bottom of the screen. Click **I drank a glass** to log it, or snooze it for 10 minutes.
+An animated hydration buddy for **Windows, macOS and Linux**. Every 30 minutes, a water drop swims onto your screen holding a glass of water, and a wave rises along the bottom of the screen. Click **I drank a glass** to log it, or snooze it.
 
 ![preview](preview.gif)
 
 ## Features
 
 - 🫧 An animated mascot that moves around your screen. Its eyes follow your mouse, and it pauses when you hover over it.
-- 🥤 A daily goal tracker (8 glasses by default), with a celebration each time you log a glass
-- 🔔 Greets you by name, shows hydration tips and plays a small "bloop" sound
-- 🌙 Quiet hours (22:00 to 08:00), snooze, and automatic hiding if you ignore it
-- 🖱️ Only the mascot and its speech bubble catch clicks. The rest of your screen keeps working normally.
-- 🧭 A system tray / menu bar icon with **Remind me now**, **Log a glass**, **Pause for 1 hour** and **Settings**
-- 🚀 Starts automatically when you log in
+- 🤫 **It won't interrupt you.** It waits while a full-screen app, presentation or call is running, or Do Not Disturb is on, and appears once you're free.
+- 🚶 **It pauses while you're away.** The countdown stops when you leave the computer. After a long break, it greets you with a "welcome back" reminder.
+- 📊 **History & stats** with a chart of glasses per day, your current and best streaks, a 7-day average and 8 achievements to unlock
+- 🥤 A daily goal tracker, a celebration each time you log a glass, and undo if you clicked by mistake
+- ⚙️ A **Settings window** for the interval, goal, glass size, quiet hours, focus/away behaviour, name, sound and start-at-login
+- 🧭 A system tray / menu bar icon with Remind me now, Log a glass, History & stats, Pause and Settings
+- 🪶 Low CPU use: it only animates while the reminder is on screen, and lowers its frame rate while the mascot moves slowly
 
-## Install
+| Settings | History & stats |
+|---|---|
+| ![Settings](docs/settings.png) | ![Stats](docs/stats.png) |
 
-First download the project, either with **Code → Download ZIP** (then unzip it) or with:
+## Download (easiest)
 
-```bash
-git clone https://github.com/mhd-mansoor/water-reminder.git
-```
+Get the file for your system from the **[latest release](https://github.com/mhd-mansoor/water-reminder/releases/latest)**. You don't need Python.
 
-### Windows
-Double-click **`install.bat`**.
-If Python isn't installed, the installer tries to install it with winget. If that doesn't work, install Python from [python.org](https://www.python.org/downloads/) (tick **"Add python.exe to PATH"**) and run `install.bat` again.
+| System | File | First launch |
+|---|---|---|
+| **Windows 10/11** | `WaterReminder-Windows.exe` | Double-click it. If Windows shows *"Windows protected your PC"*, click **More info → Run anyway**. |
+| **macOS 12+** (Apple Silicon) | `WaterReminder-macOS.dmg` | Open the .dmg and drag **Water Reminder** to **Applications**. The first time, **right-click the app → Open → Open**. |
+| **Linux** (x86-64) | `WaterReminder-Linux-x86_64` | `chmod +x WaterReminder-Linux-x86_64 && ./WaterReminder-Linux-x86_64` |
 
-### macOS
-Open **Terminal** and run:
-```bash
-bash ~/Downloads/water-reminder/install.sh
-```
-Adjust the path to wherever you put the folder. You need Python 3.9 or newer. If you don't have it, install it from [python.org](https://www.python.org/downloads/) or run `xcode-select --install`.
+The first time it runs, it installs itself for your user, turns on start-at-login and says hello. To update, download the new version and open it the same way.
 
-### Linux
-```bash
-bash water-reminder/install.sh
-```
-On Ubuntu/Debian, Fedora and Arch, the installer adds any missing system packages, which may ask for your password.
+> The apps aren't code-signed (signing costs money), which is why Windows and macOS warn you the first time.
 
-The installer sets up a private Python environment with PySide6 (Qt), turns on start-at-login and shows the reminder once so you can see it.
+## Install from source (alternative)
 
-## Usage
+You need Python 3.9 or newer. Download the project (**Code → Download ZIP**, or `git clone https://github.com/mhd-mansoor/water-reminder.git`), then:
 
-- Use the **water-drop icon** in the system tray (Windows/Linux) or menu bar (macOS) for Remind me now, Log a glass, Pause and Settings.
-- On Windows, you can also open **Start → Water Reminder** to show it right away.
-- On Linux, use the terminal commands:
+- **Windows:** double-click `install.bat`
+- **macOS / Linux:** `bash install.sh`
+
+## Using it
+
+- **The water-drop icon** in the system tray (Windows/Linux) or menu bar (macOS) has Remind me now, Log a glass, Undo, History & stats, Pause for 1 hour, Settings and Quit. Double-click the icon to open stats.
+- **In the reminder**, the ⚙ gear opens Settings, the × skips this reminder, and clicking the mascot makes it hop.
+- **Opening the app again** while it's already running opens Settings.
+- **Windows Start menu:** *Water Reminder*, *Water Reminder Settings* and *Water Reminder Stats*
+- **Linux:** the same three entries are in your app menu. You can also use the terminal commands:
 
 | Command | What it does |
 |---|---|
 | `water-reminder --now` | Show the reminder right now |
-| `water-reminder --status` | Today's progress and the last few days |
+| `water-reminder --settings` | Open Settings |
+| `water-reminder --stats` | Open History & stats |
+| `water-reminder --status` | Print today's progress and your streak |
 | `water-reminder --stop` | Stop until next login |
 
 ## Settings
 
-Choose **Settings…** from the tray menu, or edit `config.json` directly:
-
-| OS | Location |
+| Setting | Default |
 |---|---|
-| Windows | `%APPDATA%\WaterReminder\config.json` |
-| macOS | `~/Library/Application Support/WaterReminder/config.json` |
-| Linux | `~/.config/water-reminder/config.json` |
+| Remind me every | 30 min |
+| Snooze for / hide if ignored after | 10 min / 3 min |
+| Glasses per day / glass size | 8 × 250 ml |
+| Quiet hours | 22:00 – 08:00 |
+| Don't interrupt full-screen apps, presentations, calls, Do Not Disturb | on |
+| Pause while I'm away (no input for…) | on, 5 min |
+| Your name, sound, start at login | login name, on, on |
 
-| Key | Default | Meaning |
+Changes apply right away. They're saved in `config.json`:
+`%APPDATA%\WaterReminder\` (Windows), `~/Library/Application Support/WaterReminder/` (macOS), `~/.config/water-reminder/` (Linux).
+
+### How "busy" and "away" are detected
+
+| | Busy (reminder waits) | Away (countdown pauses) |
 |---|---|---|
-| `interval_minutes` | 30 | How often it appears |
-| `snooze_minutes` | 10 | Snooze length |
-| `daily_goal_glasses` | 8 | Daily target |
-| `glass_ml` | 250 | Size of one glass |
-| `quiet_hours` | 22:00–08:00 | No reminders in this window (`"enabled": false` to turn off) |
-| `auto_hide_minutes` | 3 | Leave on its own if ignored |
-| `sound` | true | Play a sound |
-| `name` | your login name | Name shown in the bubble |
+| **Windows** | Full-screen app or game, presentation mode, microphone or camera in use | No keyboard/mouse input |
+| **macOS** | A full-screen app is in front | No keyboard/mouse input |
+| **Linux** | Do Not Disturb (GNOME), microphone in use (PulseAudio/PipeWire), full-screen window (X11) | No input (GNOME, or any X11 desktop) |
 
-Changes apply from the next reminder.
+If something can't be detected on your system, reminders work normally.
 
 ## Uninstall
 
-- **Windows:** double-click `uninstall.bat`
-- **macOS / Linux:** `bash uninstall.sh`
+Open **Settings → Uninstall…**. On macOS, also drag the app from Applications to the Trash.
+If you installed from source, you can instead run `uninstall.bat` or `bash uninstall.sh`. Add `--purge` to also delete your history.
 
-Add `--purge` to also delete your history and settings.
+## For maintainers: publishing a release
+
+The workflow in `.github/workflows/release.yml` builds all three apps on GitHub's machines whenever you push. To publish a version, update `APP_VERSION` in `water_reminder.py`, then:
+
+```bash
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+After about 10 minutes, the files appear on the **Releases** page. You can build locally with `python packaging/build.py`.
 
 ## How it works
 
-It's a single Python file, `water_reminder.py`, built with [PySide6 (Qt)](https://doc.qt.io/qtforpython/). The mascot lives in a small transparent, always-on-top window that moves across the screen. The wave is a separate strip at the bottom of the screen that lets clicks pass through it. Everything is drawn in code, so there are no image files.
+It's a single Python file, `water_reminder.py`, built with [PySide6 (Qt)](https://doc.qt.io/qtforpython/). The mascot lives in a small transparent, always-on-top window that moves across the screen. The wave is a separate strip that lets clicks pass through it. Everything is drawn in code, including the icons.
 
 Start-at-login uses each system's normal mechanism:
 
 - **Windows:** a `Run` registry entry for your user
 - **macOS:** a LaunchAgent
 - **Linux:** an XDG autostart entry
+
+The packaged apps are built with PyInstaller.
 
 ## License
 

@@ -9,6 +9,8 @@ of water, while a wave rises along the bottom of the screen. Click
 Usage:
   water_reminder.py              run in the background (normally started at login)
   water_reminder.py --now        show the reminder right now
+  water_reminder.py --settings   open the settings window
+  water_reminder.py --stats      open history & stats
   water_reminder.py --status     print today's progress
   water_reminder.py --stop       stop the background reminder
   water_reminder.py --install    set up start-at-login for this user
@@ -31,8 +33,11 @@ import subprocess
 import sys
 import time
 import wave
+from functools import lru_cache
 
 APP_NAME = "Water Reminder"
+APP_VERSION = "1.2.0"
+IS_FROZEN = bool(getattr(sys, "frozen", False))
 APP_ID = "water-reminder"
 IS_WIN = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
@@ -44,12 +49,14 @@ if IS_LINUX and os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY") 
     os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 try:
-    from PySide6.QtCore import QCoreApplication, QElapsedTimer, QPointF, QRectF, Qt, QTimer, QUrl
-    from PySide6.QtGui import (QAction, QColor, QCursor, QDesktopServices, QFont, QFontMetricsF,
+    from PySide6.QtCore import QCoreApplication, QElapsedTimer, QPointF, QRectF, Qt, QTime, QTimer
+    from PySide6.QtGui import (QAction, QColor, QCursor, QFont, QFontMetricsF,
                                QGuiApplication, QIcon, QLinearGradient, QPainter, QPainterPath,
                                QPen, QPixmap, QPolygonF, QRadialGradient)
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
-    from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
+    from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout,
+                                   QLabel, QLineEdit, QMenu, QPushButton, QSpinBox, QSystemTrayIcon,
+                                   QTimeEdit, QVBoxLayout, QWidget)
 except ImportError:
     print("PySide6 is not installed. Run:  python3 -m pip install PySide6-Essentials", file=sys.stderr)
     sys.exit(1)
@@ -89,6 +96,9 @@ DEFAULTS = {
     "auto_hide_minutes": 3,
     "sound": True,
     "name": "",
+    "respect_focus": True,      # don't interrupt full-screen apps, presentations, calls, DND
+    "pause_when_away": True,    # freeze the countdown while you're away from the computer
+    "away_minutes": 5,
 }
 
 TIPS = [
@@ -130,6 +140,14 @@ def load_config():
         return dict(DEFAULTS)
 
 
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG_FILE)
+
+
 def load_state():
     today = datetime.date.today().isoformat()
     try:
@@ -147,12 +165,40 @@ def load_state():
 def save_state(st):
     os.makedirs(DATA_DIR, exist_ok=True)
     st["history"][st["date"]] = st["count"]
-    for k in sorted(st["history"])[:-60]:
+    for k in sorted(st["history"])[:-400]:
         del st["history"][k]
+    times = st.get("times", {})
+    for k in sorted(times)[:-60]:
+        del times[k]
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(st, f, indent=2)
     os.replace(tmp, STATE_FILE)
+
+
+def record_glass():
+    """Log one glass now; returns the updated state."""
+    st = load_state()
+    if "total" not in st:
+        st["total"] = sum(v for k, v in st["history"].items() if k != st["date"]) + st["count"]
+    st["count"] += 1
+    st["total"] += 1
+    st.setdefault("times", {}).setdefault(st["date"], []).append(datetime.datetime.now().strftime("%H:%M"))
+    save_state(st)
+    return st
+
+
+def undo_glass():
+    st = load_state()
+    if st["count"] > 0:
+        st["count"] -= 1
+        if "total" in st:
+            st["total"] = max(0, st["total"] - 1)
+        times = st.get("times", {}).get(st["date"])
+        if times:
+            times.pop()
+        save_state(st)
+    return st
 
 
 def in_quiet_hours(cfg):
@@ -269,6 +315,12 @@ class _X11:
                 ctypes.POINTER(XRectangle), ctypes.c_int, ctypes.c_int, ctypes.c_int]
             cls._dpy = cls.xlib.XOpenDisplay(None)
             cls._ok = bool(cls._dpy)
+            # Xlib's default error handler exits the process; ignore errors instead
+            # (e.g. a window that closed while we were reading its properties).
+            handler_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+            cls._err_handler = handler_t(lambda _d, _e: 0)
+            cls.xlib.XSetErrorHandler.argtypes = [handler_t]
+            cls.xlib.XSetErrorHandler(cls._err_handler)
         except Exception:
             cls._ok = False
         return cls._ok
@@ -292,9 +344,298 @@ class _X11:
         cls.xext.XShapeCombineRectangles(cls._dpy, int(wid), 2, 0, 0, arr, len(rects), 0, 0)
         cls.xlib.XFlush(cls._dpy)
 
+    @classmethod
+    def _prep_prop(cls):
+        if getattr(cls, "_prop_ready", False):
+            return
+        ct, x = cls.ct, cls.xlib
+        x.XGetWindowProperty.argtypes = [ct.c_void_p, ct.c_ulong, ct.c_ulong, ct.c_long, ct.c_long, ct.c_int,
+                                         ct.c_ulong, ct.POINTER(ct.c_ulong), ct.POINTER(ct.c_int),
+                                         ct.POINTER(ct.c_ulong), ct.POINTER(ct.c_ulong),
+                                         ct.POINTER(ct.POINTER(ct.c_ubyte))]
+        x.XFree.argtypes = [ct.c_void_p]
+        x.XDefaultRootWindow.restype = ct.c_ulong
+        x.XDefaultRootWindow.argtypes = [ct.c_void_p]
+        x.XSync.argtypes = [ct.c_void_p, ct.c_int]
+        cls._prop_ready = True
+
+    @classmethod
+    def _prop(cls, win, name):
+        """Return a list of 32-bit items of a window property (or [])."""
+        ct = cls.ct
+        x = cls.xlib
+        cls._prep_prop()
+        atom = x.XInternAtom(cls._dpy, name.encode(), 0)
+        at, af, n, after = ct.c_ulong(), ct.c_int(), ct.c_ulong(), ct.c_ulong()
+        data = ct.POINTER(ct.c_ubyte)()
+        if x.XGetWindowProperty(cls._dpy, win, atom, 0, 1024, 0, 0, ct.byref(at), ct.byref(af), ct.byref(n),
+                                ct.byref(after), ct.byref(data)) != 0 or not data:
+            return []
+        try:
+            if af.value != 32:
+                return []
+            arr = ct.cast(data, ct.POINTER(ct.c_ulong))
+            return [arr[i] for i in range(n.value)]
+        finally:
+            x.XFree(data)
+
+    @classmethod
+    def active_window_fullscreen(cls):
+        if not cls._init():
+            return False
+        cls._prep_prop()
+        root = cls.xlib.XDefaultRootWindow(cls._dpy)
+        active = cls._prop(root, "_NET_ACTIVE_WINDOW")
+        if not active or not active[0]:
+            return False
+        full = cls.xlib.XInternAtom(cls._dpy, b"_NET_WM_STATE_FULLSCREEN", 0)
+        states = cls._prop(active[0], "_NET_WM_STATE")
+        cls.xlib.XSync(cls._dpy, 0)  # flush any (harmless, ignored) BadWindow error
+        return full in states
+
+    @classmethod
+    def idle_seconds(cls):
+        """X screensaver idle time (X11 sessions only)."""
+        if not cls._init():
+            return None
+        ct = cls.ct
+        if not hasattr(cls, "xss"):
+            import ctypes.util
+
+            class Info(ct.Structure):
+                _fields_ = [("window", ct.c_ulong), ("state", ct.c_int), ("kind", ct.c_int),
+                            ("til_or_since", ct.c_ulong), ("idle", ct.c_ulong), ("eventMask", ct.c_ulong)]
+            try:
+                cls.xss = ct.CDLL(ctypes.util.find_library("Xss") or "libXss.so.1")
+            except OSError:
+                cls.xss = None
+                return None
+            cls.xss.XScreenSaverAllocInfo.restype = ct.POINTER(Info)
+            cls.xss.XScreenSaverQueryInfo.argtypes = [ct.c_void_p, ct.c_ulong, ct.POINTER(Info)]
+            cls.xlib.XDefaultRootWindow.restype = ct.c_ulong
+            cls.xlib.XDefaultRootWindow.argtypes = [ct.c_void_p]
+            cls.xss_info = cls.xss.XScreenSaverAllocInfo()
+        if not cls.xss:
+            return None
+        root = cls.xlib.XDefaultRootWindow(cls._dpy)
+        if not cls.xss.XScreenSaverQueryInfo(cls._dpy, root, cls.xss_info):
+            return None
+        return cls.xss_info.contents.idle / 1000.0
+
 
 def is_x11():
     return IS_LINUX and QGuiApplication.platformName() == "xcb"
+
+
+# --------------------------------------------------------------------------- #
+# System probes: how long the user has been idle, and whether they are busy
+# (full-screen app / presentation / call / Do Not Disturb). All best-effort:
+# any failure means "unknown", which never blocks a reminder.
+# --------------------------------------------------------------------------- #
+def _run(cmd, timeout=2):
+    try:
+        flags = 0x08000000 if IS_WIN else 0  # CREATE_NO_WINDOW: no console flash
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=flags)
+        return r.stdout if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _win_idle():
+    import ctypes
+
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+    lii = LASTINPUTINFO()
+    lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+        return None
+    now = ctypes.windll.kernel32.GetTickCount() & 0xFFFFFFFF
+    return ((now - lii.dwTime) & 0xFFFFFFFF) / 1000.0
+
+
+def _win_device_in_use(device):
+    """True if any app is using the microphone/webcam right now (Windows 10/11 privacy registry)."""
+    import winreg
+    base = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore" + "\\" + device
+
+    def walk(path, depth=0):
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, path)
+        except OSError:
+            return False
+        with key:
+            try:
+                start = winreg.QueryValueEx(key, "LastUsedTimeStart")[0]
+                stop = winreg.QueryValueEx(key, "LastUsedTimeStop")[0]
+                if start and not stop:
+                    return True
+            except OSError:
+                pass
+            if depth < 3:
+                i = 0
+                while True:
+                    try:
+                        sub = winreg.EnumKey(key, i)
+                    except OSError:
+                        break
+                    if walk(path + "\\" + sub, depth + 1):
+                        return True
+                    i += 1
+        return False
+    return walk(base)
+
+
+def _win_busy():
+    import ctypes
+    state = ctypes.c_int(0)
+    if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state)) == 0:
+        if state.value in (2, 3):   # QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN
+            return "a full-screen app"
+        if state.value == 4:        # QUNS_PRESENTATION_MODE
+            return "presentation mode"
+    if _win_device_in_use("microphone") or _win_device_in_use("webcam"):
+        return "a call"
+    return None
+
+
+def _mac_idle():
+    import ctypes
+    cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+    f = cg.CGEventSourceSecondsSinceLastEventType
+    f.restype = ctypes.c_double
+    f.argtypes = [ctypes.c_int32, ctypes.c_uint32]
+    return f(1, 0xFFFFFFFF)  # HID system state, any input event
+
+
+def _mac_fullscreen():
+    """Is the frontmost normal window covering the whole main display?"""
+    import ctypes as ct
+    cf = ct.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    cg = ct.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+
+    class CGPoint(ct.Structure):
+        _fields_ = [("x", ct.c_double), ("y", ct.c_double)]
+
+    class CGSize(ct.Structure):
+        _fields_ = [("width", ct.c_double), ("height", ct.c_double)]
+
+    class CGRect(ct.Structure):
+        _fields_ = [("origin", CGPoint), ("size", CGSize)]
+
+    cg.CGWindowListCopyWindowInfo.restype = ct.c_void_p
+    cg.CGWindowListCopyWindowInfo.argtypes = [ct.c_uint32, ct.c_uint32]
+    cg.CGMainDisplayID.restype = ct.c_uint32
+    cg.CGDisplayBounds.restype = CGRect
+    cg.CGDisplayBounds.argtypes = [ct.c_uint32]
+    cg.CGRectMakeWithDictionaryRepresentation.restype = ct.c_bool
+    cg.CGRectMakeWithDictionaryRepresentation.argtypes = [ct.c_void_p, ct.POINTER(CGRect)]
+    cf.CFArrayGetCount.restype = ct.c_long
+    cf.CFArrayGetCount.argtypes = [ct.c_void_p]
+    cf.CFArrayGetValueAtIndex.restype = ct.c_void_p
+    cf.CFArrayGetValueAtIndex.argtypes = [ct.c_void_p, ct.c_long]
+    cf.CFDictionaryGetValue.restype = ct.c_void_p
+    cf.CFDictionaryGetValue.argtypes = [ct.c_void_p, ct.c_void_p]
+    cf.CFStringCreateWithCString.restype = ct.c_void_p
+    cf.CFStringCreateWithCString.argtypes = [ct.c_void_p, ct.c_char_p, ct.c_uint32]
+    cf.CFNumberGetValue.restype = ct.c_bool
+    cf.CFNumberGetValue.argtypes = [ct.c_void_p, ct.c_int, ct.c_void_p]
+    cf.CFRelease.argtypes = [ct.c_void_p]
+
+    keys = [cf.CFStringCreateWithCString(None, k, 0x08000100)
+            for k in (b"kCGWindowLayer", b"kCGWindowOwnerPID", b"kCGWindowBounds")]
+    arr = cg.CGWindowListCopyWindowInfo(1 | 16, 0)  # on-screen only, exclude desktop
+    try:
+        if not arr:
+            return False
+        disp = cg.CGDisplayBounds(cg.CGMainDisplayID())
+        for i in range(cf.CFArrayGetCount(arr)):
+            d = cf.CFArrayGetValueAtIndex(arr, i)
+            layer, pid = ct.c_int(-1), ct.c_int(0)
+            v = cf.CFDictionaryGetValue(d, keys[0])
+            if not v or not cf.CFNumberGetValue(v, 9, ct.byref(layer)) or layer.value != 0:
+                continue
+            v = cf.CFDictionaryGetValue(d, keys[1])
+            if v and cf.CFNumberGetValue(v, 9, ct.byref(pid)) and pid.value == os.getpid():
+                continue
+            r = CGRect()
+            b = cf.CFDictionaryGetValue(d, keys[2])
+            if not b or not cg.CGRectMakeWithDictionaryRepresentation(b, ct.byref(r)):
+                continue
+            return r.size.width >= disp.size.width and r.size.height >= disp.size.height
+        return False
+    finally:
+        if arr:
+            cf.CFRelease(arr)
+        for k in keys:
+            if k:
+                cf.CFRelease(k)
+
+
+def _mac_busy():
+    return "a full-screen app" if _mac_fullscreen() else None
+
+
+_MUTTER_OK = None
+
+
+def _linux_idle():
+    global _MUTTER_OK
+    desktop = (os.environ.get("XDG_CURRENT_DESKTOP", "") + os.environ.get("DESKTOP_SESSION", "")).lower()
+    if _MUTTER_OK is not False and shutil.which("gdbus") and "gnome" in desktop + "ubuntu":
+        out = _run(["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.IdleMonitor",
+                    "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
+                    "--method", "org.gnome.Mutter.IdleMonitor.GetIdletime"])
+        m = re.search(r"(\d+)", out or "")
+        _MUTTER_OK = bool(m)
+        if m:
+            return int(m.group(1)) / 1000.0
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        return None  # XWayland can't see native Wayland input: unknown is safer than "away"
+    return _X11.idle_seconds()
+
+
+def _linux_busy():
+    out = _run(["gsettings", "get", "org.gnome.desktop.notifications", "show-banners"]) \
+        if shutil.which("gsettings") else None
+    if out and out.strip() == "false":
+        return "Do Not Disturb"
+    if shutil.which("pactl"):
+        out = _run(["pactl", "list", "source-outputs", "short"])
+        if out and out.strip():
+            return "a call"
+    if os.environ.get("DISPLAY") and _X11.active_window_fullscreen():
+        return "a full-screen app"
+    return None
+
+
+class Probes:
+    _cache = {}
+
+    @classmethod
+    def _cached(cls, key, ttl, fn):
+        now = time.monotonic()
+        hit = cls._cache.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+        try:
+            val = fn()
+        except Exception:
+            val = None
+        cls._cache[key] = (now, val)
+        return val
+
+    @classmethod
+    def idle_seconds(cls):
+        """Seconds since the last keyboard/mouse input, or None if unknown."""
+        fn = _win_idle if IS_WIN else _mac_idle if IS_MAC else _linux_idle
+        return cls._cached("idle", 5, fn)
+
+    @classmethod
+    def busy_reason(cls):
+        """A short reason the user shouldn't be interrupted right now, or None."""
+        fn = _win_busy if IS_WIN else _mac_busy if IS_MAC else _linux_busy
+        return cls._cached("busy", 10, fn)
 
 
 def mac_hide_dock_icon():
@@ -417,6 +758,7 @@ def rad(cx, cy, r, stops):
     return g
 
 
+@lru_cache(maxsize=64)
 def make_font(px, bold=False):
     f = QFont(QGuiApplication.font())
     f.setPixelSize(max(1, int(round(px))))
@@ -424,9 +766,15 @@ def make_font(px, bold=False):
     return f
 
 
-def text_height(font, text, width):
-    fm = QFontMetricsF(font)
+@lru_cache(maxsize=256)
+def _text_height(font_key, text, width):
+    px, bold = font_key
+    fm = QFontMetricsF(make_font(px, bold))
     return fm.boundingRect(QRectF(0, 0, width, 100000), int(Qt.TextWordWrap), text).height()
+
+
+def text_height(font, text, width):
+    return _text_height((font.pixelSize(), font.bold()), text, round(width, 1))
 
 
 def draw_glass(p, x, y, w, h, level, t, tilt=0.0):
@@ -471,8 +819,9 @@ class Scene:
     EXIT_DUR = 1.6
     CELEBRATE_DUR = 2.6
 
-    def __init__(self, W, H, cfg, count, name, compact=False):
+    def __init__(self, W, H, cfg, count, name, compact=False, intro=None):
         self.cfg = cfg
+        self.intro = intro
         self.compact = compact
         self.count = count
         self.goal = max(1, int(cfg.get("daily_goal_glasses", 8)))
@@ -490,7 +839,7 @@ class Scene:
         self.bh_max = max(self.bubble_height(False), self.bubble_height(True))
         self.margin = 60 * u
         self.wave_h = 0 if compact else 70 * u
-        self.fx_h = int(self.wave_h + 80 * u)
+        self.fx_h = int(self.wave_h + 50 * u)
 
         # Layout of the (moving) mascot window, relative to the drop's centre
         self.win_w = int(self.bw + 2 * self.margin)
@@ -535,6 +884,12 @@ class Scene:
             if count < self.goal:
                 return f"Great job, {self.name}!", f"+{self.ml} ml logged. Your body says thank you."
             return "Daily goal reached!", "You're a hydration hero today. Keep sipping!"
+        if self.intro == "welcome":
+            return f"Welcome back, {self.name}!", "Good to see you again. Start with a fresh glass of water."
+        if self.intro == "hello":
+            mins = int(self.cfg.get("interval_minutes", 30))
+            return (f"Hi {self.name}, I'm your water buddy!",
+                    f"I'll drop by every {mins} minutes. Click the gear to change that.")
         return f"Time to drink water, {self.name}!", self.tip
 
     def bubble_height(self, celebrate):
@@ -543,7 +898,7 @@ class Scene:
         best = 0
         for c in (self.count + 1, self.goal + 1):
             title, sub = self._texts(celebrate, c)
-            th = text_height(make_font(19 * u, True), title, inner - 58 * u)
+            th = text_height(make_font(19 * u, True), title, inner - 84 * u)
             sh = text_height(make_font(13.5 * u), sub, inner)
             best = max(best, self._bh(th, sh, celebrate))
         return best
@@ -707,7 +1062,7 @@ class Scene:
                 self._wave_spawn -= 1
                 self.particles.append(Particle("bubble", random.uniform(0, self.W),
                                                self.H - random.uniform(5, 40) * u, 0,
-                                               -random.uniform(25, 55) * u, random.uniform(3, 9) * u,
+                                               -random.uniform(15, 35) * u, random.uniform(3, 8) * u,
                                                random.uniform(1.2, 2.4)))
         sp = math.hypot(*self.vel)
         if sp > 30 * u and not self.compact:
@@ -798,7 +1153,7 @@ class Scene:
         for amp, freq, spd, lift, alpha in ((12 * u, 0.0060, 0.9, 18 * u, 0.30),
                                             (9 * u, 0.0085, -1.3, 0.0, 0.42)):
             pts = []
-            for x in range(-20, int(W) + 40, 16):
+            for x in range(-24, int(W) + 48, 24):
                 pts.append(QPointF(x, H - base - lift + amp * math.sin(x * freq + t * spd)
                                    + amp * 0.45 * math.sin(x * freq * 2.3 - t * spd * 1.6)))
             body = QPainterPath()
@@ -985,7 +1340,7 @@ class Scene:
         if self.bubble_vis <= 0.001:
             return
         u, R, pad = self.u, self.R, self.pad
-        W, H = self.W, self.H
+        W = self.W
         x, y = self.pos
         bw = self.bw
         inner = bw - 2 * pad
@@ -993,7 +1348,7 @@ class Scene:
 
         title, sub = self._texts(celebrate)
         f_title, f_sub = make_font(19 * u, True), make_font(13.5 * u)
-        th = text_height(f_title, title, inner - 58 * u)
+        th = text_height(f_title, title, inner - 84 * u)
         sh = text_height(f_sub, sub, inner)
         btn_h = 0 if celebrate else 42 * u
         bh = self._bh(th, sh, celebrate)
@@ -1039,7 +1394,7 @@ class Scene:
                  [(0, C(0.6, 0.9, 1.0)), (1, C(0.1, 0.45, 0.92))]))
         p.setFont(f_title)
         p.setPen(C(0.05, 0.18, 0.38))
-        p.drawText(QRectF(bx + pad + 30 * u, cy - th / 2 - 1, inner - 58 * u, th + 4),
+        p.drawText(QRectF(bx + pad + 30 * u, cy - th / 2 - 1, inner - 84 * u, th + 4),
                    int(Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop), title)
 
         self.buttons = {}
@@ -1056,6 +1411,21 @@ class Scene:
             xp.lineTo(ccx - k, ccy + k)
             stroke(p, xp, C(0.35, 0.45, 0.58, 1 if hov else 0.7), 2 * u)
             self.buttons["skip"] = (ccx - cr - 4 * u, ccy - cr - 4 * u, 2 * cr + 8 * u, 2 * cr + 8 * u)
+            # settings (gear) button
+            gx0, hov = ccx - 28 * u, self.hover == "settings"
+            if hov:
+                ellipse(p, gx0, ccy, cr, cr, C(0.85, 0.91, 0.98))
+            col = C(0.35, 0.45, 0.58, 1 if hov else 0.7)
+            teeth = QPainterPath()
+            for i in range(8):
+                a = i * math.pi / 4 + (self.t * 0.8 if hov else 0)
+                teeth.moveTo(gx0 + math.cos(a) * 4.5 * u, ccy + math.sin(a) * 4.5 * u)
+                teeth.lineTo(gx0 + math.cos(a) * 7.5 * u, ccy + math.sin(a) * 7.5 * u)
+            stroke(p, teeth, col, 2.4 * u)
+            ring = QPainterPath()
+            ring.addEllipse(QPointF(gx0, ccy), 5 * u, 5 * u)
+            stroke(p, ring, col, 2 * u)
+            self.buttons["settings"] = (gx0 - cr - 2 * u, ccy - cr - 4 * u, 2 * cr + 4 * u, 2 * cr + 8 * u)
 
         yy = by + pad + th_box + 6 * u
         p.setFont(f_sub)
@@ -1188,13 +1558,15 @@ class FxWindow(QWidget):
 class Overlay:
     """One reminder appearance: creates the windows and drives the animation."""
 
-    def __init__(self, cfg, count, on_done):
+    def __init__(self, cfg, count, on_done, on_settings=None, intro=None):
         self.on_done = on_done
+        self.on_settings = on_settings
         screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
         self.avail = screen.availableGeometry()
         self.x11 = is_x11()
         compact = self.x11 and not _X11.has_compositor()
-        self.scene = Scene(self.avail.width(), self.avail.height(), cfg, count, user_first_name(cfg), compact)
+        self.scene = Scene(self.avail.width(), self.avail.height(), cfg, count, user_first_name(cfg), compact,
+                           intro=intro)
         self.fx = None
         if not compact:
             self.fx = FxWindow(self)
@@ -1211,6 +1583,7 @@ class Overlay:
         self.mascot.raise_()
         self._cursor_hand = False
         self._frame = 0
+        self._fx_acc = 0.0
         self._finished = False
         self.clock = QElapsedTimer()
         self.clock.start()
@@ -1228,6 +1601,9 @@ class Overlay:
         h = self.scene.hit(sx, sy)
         if h == "drop":
             self.scene.poke()
+        elif h == "settings" and self.on_settings:
+            self.scene.leave("skip")  # step aside so the window isn't covered
+            self.on_settings()
         elif h in ("drank", "snooze", "skip"):
             if h == "drank" and self.scene.cfg.get("sound", True):
                 play_sound("done")
@@ -1260,9 +1636,20 @@ class Overlay:
                 self._update_input_shape()
             if self._frame % 120 == 0:
                 self.mascot.raise_()
+        # Adaptive frame rate: 60 fps for fast motion, 30 fps while gently roaming.
+        s_ = self.scene
+        fast = (s_.state in ("enter", "exit", "celebrate") or s_.jump_t >= 0
+                or any(q.kind in ("drop", "spark") for q in s_.particles))
+        want = 16 if fast else 33
+        if self.timer.interval() != want:
+            self.timer.setInterval(want)
         self.mascot.update()
+        # The wave moves slowly, so the wide wave strip only repaints at ~20 fps.
         if self.fx:
-            self.fx.update()
+            self._fx_acc += dt
+            if self._fx_acc >= 0.048:
+                self._fx_acc = 0.0
+                self.fx.update()
 
     def _update_input_shape(self):
         ox, oy = self.mascot.origin
@@ -1289,7 +1676,7 @@ class Overlay:
 
 
 # --------------------------------------------------------------------------- #
-# Background service + tray icon
+# Icons
 # --------------------------------------------------------------------------- #
 def drop_icon(size=64):
     pm = QPixmap(size, size)
@@ -1305,38 +1692,911 @@ def drop_icon(size=64):
     return QIcon(pm)
 
 
+def render_app_icon(size=1024):
+    """The app icon (used for the .exe/.app): the mascot on a soft rounded tile."""
+    from PySide6.QtGui import QImage
+    img = QImage(size, size, QImage.Format_ARGB32_Premultiplied)
+    img.fill(Qt.transparent)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.Antialiasing)
+    m = size * 0.06
+    fill(p, rounded(m, m, size - 2 * m, size - 2 * m, size * 0.22),
+         lin(0, 0, size, size, [(0, C(0.90, 0.97, 1.0)), (1, C(0.70, 0.86, 1.0))]))
+    R = size * 0.27
+    cx, cy = size / 2, size * 0.60
+    body = drop_path(R, cx, cy)
+    fill(p, body, lin(cx - R, cy - 1.75 * R, cx + R, cy + R,
+                      [(0, C(0.66, 0.92, 1.0)), (0.5, C(0.26, 0.66, 0.98)), (1, C(0.07, 0.37, 0.84))]))
+    p.save()
+    p.translate(cx - 0.45 * R, cy - 0.35 * R)
+    p.rotate(20)
+    ellipse(p, 0, 0, 0.17 * R, 0.40 * R, C(1, 1, 1, 0.55))
+    p.restore()
+    dark = C(0.06, 0.12, 0.28)
+    for sx in (-1, 1):
+        ellipse(p, cx + sx * 0.62 * R, cy + 0.24 * R, 0.15 * R, 0.085 * R, C(1.0, 0.45, 0.62, 0.55))
+        ellipse(p, cx + sx * 0.36 * R, cy - 0.05 * R, 0.2 * R, 0.25 * R, C(1, 1, 1))
+        ellipse(p, cx + sx * 0.36 * R, cy - 0.03 * R, 0.13 * R, 0.13 * R, dark)
+        ellipse(p, cx + sx * 0.36 * R - 0.045 * R, cy - 0.08 * R, 0.045 * R, 0.045 * R, C(1, 1, 1))
+    stroke(p, arc_path(cx, cy + 0.16 * R, 0.17 * R, math.pi * 0.18, math.pi * 0.82), dark, 0.065 * R)
+    p.end()
+    return img
+
+
+# --------------------------------------------------------------------------- #
+# Start at login + menu shortcuts (per OS)
+# --------------------------------------------------------------------------- #
+MAC_PLIST = _home("Library", "LaunchAgents", "com.waterreminder.agent.plist")
+LINUX_AUTOSTART = os.path.join(os.environ.get("XDG_CONFIG_HOME") or _home(".config"), "autostart",
+                               "water-reminder.desktop")
+_LINUX_APPS = os.path.join(os.environ.get("XDG_DATA_HOME") or _home(".local", "share"), "applications")
+LINUX_LAUNCHER = os.path.join(_LINUX_APPS, "water-reminder.desktop")
+LINUX_SETTINGS = os.path.join(_LINUX_APPS, "water-reminder-settings.desktop")
+LINUX_STATS = os.path.join(_LINUX_APPS, "water-reminder-stats.desktop")
+LINUX_BIN = _home(".local", "bin", "water-reminder")
+LINUX_ICON = os.path.join(DATA_DIR, "icon.png")
+WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_WIN_PROGRAMS = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs")
+WIN_SHORTCUTS = [("Water Reminder.lnk", "--now", "Show the water reminder now"),
+                 ("Water Reminder Settings.lnk", "--settings", "Water Reminder settings"),
+                 ("Water Reminder Stats.lnk", "--stats", "Your hydration history")]
+
+
+def _gui_python():
+    py = sys.executable
+    if IS_WIN:
+        pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
+        if os.path.exists(pyw):
+            return pyw
+    return py
+
+
+def launch_command():
+    """The command that starts this app (packaged executable, or python + script)."""
+    if IS_FROZEN:
+        return [sys.executable]
+    installed = os.path.join(APP_DIR, "water_reminder.py")
+    script = installed if os.path.exists(installed) else os.path.abspath(__file__)
+    return [_gui_python(), script]
+
+
+def _desktop_exec(cmd):
+    return " ".join(f'"{c}"' if " " in c else c for c in cmd)
+
+
+def autostart_is_enabled():
+    if IS_WIN:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_RUN_KEY) as key:
+                winreg.QueryValueEx(key, "WaterReminder")
+            return True
+        except OSError:
+            return False
+    return os.path.exists(MAC_PLIST if IS_MAC else LINUX_AUTOSTART)
+
+
+def autostart_enable(cmd=None):
+    cmd = cmd or launch_command()
+    if IS_WIN:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "WaterReminder", 0, winreg.REG_SZ, subprocess.list2cmdline(cmd))
+    elif IS_MAC:
+        import plistlib
+        os.makedirs(os.path.dirname(MAC_PLIST), exist_ok=True)
+        with open(MAC_PLIST, "wb") as f:
+            plistlib.dump({"Label": "com.waterreminder.agent", "ProgramArguments": list(cmd),
+                           "RunAtLoad": True, "LimitLoadToSessionType": "Aqua",
+                           "StandardOutPath": LOG_FILE, "StandardErrorPath": LOG_FILE}, f)
+    else:
+        os.makedirs(os.path.dirname(LINUX_AUTOSTART), exist_ok=True)
+        with open(LINUX_AUTOSTART, "w") as f:
+            f.write("[Desktop Entry]\nType=Application\nName=Water Reminder\n"
+                    f"Comment=Animated reminder to drink water\nExec={_desktop_exec(cmd)}\n"
+                    f"Icon={LINUX_ICON}\nX-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Delay=20\n")
+
+
+def autostart_disable():
+    if IS_WIN:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, "WaterReminder")
+        except OSError:
+            pass
+    else:
+        try:
+            os.remove(MAC_PLIST if IS_MAC else LINUX_AUTOSTART)
+        except OSError:
+            pass
+
+
+def create_shortcuts(cmd=None):
+    """Start-menu (Windows) / app-menu (Linux) entries. macOS uses the menu-bar icon."""
+    cmd = cmd or launch_command()
+    if IS_WIN:
+        def q(v):
+            return v.replace("'", "''")
+        target, args = cmd[0], subprocess.list2cmdline(cmd[1:])
+        ps = "$w=New-Object -ComObject WScript.Shell;"
+        for name, flag, desc in WIN_SHORTCUTS:
+            lnk = os.path.join(_WIN_PROGRAMS, name)
+            ps += (f"$s=$w.CreateShortcut('{q(lnk)}');$s.TargetPath='{q(target)}';"
+                   f"$s.Arguments='{q((args + ' ' + flag).strip())}';$s.Description='{q(desc)}';$s.Save();")
+        _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=30)
+    elif IS_LINUX:
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            render_app_icon(256).save(LINUX_ICON)
+        except Exception:
+            pass
+        os.makedirs(_LINUX_APPS, exist_ok=True)
+        os.makedirs(os.path.dirname(LINUX_BIN), exist_ok=True)
+        with open(LINUX_BIN, "w") as f:
+            f.write("#!/bin/sh\nexec " + " ".join(f'"{c}"' for c in cmd) + ' "$@"\n')
+        os.chmod(LINUX_BIN, 0o755)
+        for path, name, flag, comment in (
+                (LINUX_LAUNCHER, "Water Reminder", "--now", "Show the water reminder now"),
+                (LINUX_SETTINGS, "Water Reminder Settings", "--settings", "Change how often it reminds you"),
+                (LINUX_STATS, "Water Reminder Stats", "--stats", "Your hydration history and streaks")):
+            with open(path, "w") as f:
+                f.write(f"[Desktop Entry]\nType=Application\nName={name}\nComment={comment}\n"
+                        f"Exec={_desktop_exec(cmd)} {flag}\nIcon={LINUX_ICON}\nCategories=Utility;\n"
+                        "Keywords=water;drink;hydration;reminder;\n")
+
+
+def remove_shortcuts():
+    paths = ([os.path.join(_WIN_PROGRAMS, n) for n, _, _ in WIN_SHORTCUTS] if IS_WIN else
+             [LINUX_LAUNCHER, LINUX_SETTINGS, LINUX_STATS, LINUX_BIN] if IS_LINUX else [])
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def spawn_detached(cmd):
+    if IS_WIN:
+        subprocess.Popen(cmd, creationflags=0x00000008 | 0x00000200, close_fds=True)
+    else:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(LOG_FILE, "a") as log:
+            subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+# --------------------------------------------------------------------------- #
+# Shared window styling
+# --------------------------------------------------------------------------- #
+APP_QSS = """
+QDialog { background: #f2f7ff; }
+QLabel { color: #1b2b44; font-size: 13px; }
+QLabel#title { font-size: 21px; font-weight: 700; color: #0d2e61; }
+QLabel#subtitle { color: #5b6b80; font-size: 12px; }
+QLabel#cardTitle { font-size: 11px; font-weight: 700; color: #2a6fd6; letter-spacing: 1px; }
+QLabel#hint { color: #6b7a8f; font-size: 11px; }
+QLabel#kpi { font-size: 24px; font-weight: 700; color: #0d2e61; }
+QLabel#kpiLabel { color: #5b6b80; font-size: 11px; }
+QLabel#badgeIcon { font-size: 24px; }
+QLabel#badgeTitle { font-size: 12px; font-weight: 700; color: #0d2e61; }
+QLabel#badgeDesc { font-size: 11px; color: #6b7a8f; }
+QFrame#card { background: #ffffff; border: 1px solid #d6e6fb; border-radius: 12px; }
+QFrame#tile { background: #ffffff; border: 1px solid #d6e6fb; border-radius: 12px; }
+QFrame#badge { background: #f7fbff; border: 1px solid #e1ecfa; border-radius: 10px; }
+QSpinBox, QTimeEdit, QLineEdit {
+    background: #f7fbff; border: 1px solid #c9dcf5; border-radius: 8px;
+    padding: 4px 8px; min-height: 24px; color: #13243d; font-size: 13px;
+    selection-background-color: #3b8cf0;
+}
+QSpinBox::up-button, QSpinBox::down-button, QTimeEdit::up-button, QTimeEdit::down-button {
+    width: 0px; height: 0px; border: none; subcontrol-origin: border;
+}
+QSpinBox:focus, QTimeEdit:focus, QLineEdit:focus { border: 1px solid #3b8cf0; background: #ffffff; }
+QSpinBox:disabled, QTimeEdit:disabled { color: #9aa8ba; background: #f0f3f7; }
+QCheckBox { color: #1b2b44; font-size: 13px; spacing: 8px; }
+QPushButton {
+    background: #e8f2ff; border: 1px solid #c2d9f7; border-radius: 9px;
+    padding: 7px 16px; color: #1d5fc2; font-size: 13px;
+}
+QPushButton:hover { background: #dcebff; }
+QPushButton:disabled { color: #9aa8ba; background: #f0f3f7; border-color: #dde5ef; }
+QPushButton#primary {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #48b0ff, stop:1 #1a70f0);
+    color: white; border: none; font-weight: 600; padding: 8px 22px;
+}
+QPushButton#primary:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #5cbcff, stop:1 #2a80ff);
+}
+QPushButton#flat { background: transparent; border: none; color: #5b6b80; padding: 7px 4px; }
+QPushButton#flat:hover { color: #1d5fc2; }
+QPushButton#step {
+    background: #eef5ff; border: 1px solid #c9dcf5; border-radius: 8px; padding: 0;
+    min-width: 30px; max-width: 30px; min-height: 30px; max-height: 30px;
+    font-size: 17px; font-weight: 600; color: #2a6fd6;
+}
+QPushButton#step:hover { background: #dcebff; }
+QPushButton#step:pressed { background: #c9e0ff; }
+QPushButton#seg { padding: 5px 12px; border-radius: 8px; font-size: 12px; }
+QPushButton#seg:checked { background: #1a70f0; color: white; border-color: #1a70f0; }
+QToolTip { background: #0d2e61; color: white; border: none; padding: 6px 8px; border-radius: 6px; }
+"""
+
+
+def _header(title, subtitle):
+    head = QHBoxLayout()
+    icon = QLabel()
+    icon.setPixmap(drop_icon(96).pixmap(48, 48))
+    head.addWidget(icon)
+    titles = QVBoxLayout()
+    titles.setSpacing(0)
+    titles.addWidget(QLabel(title, objectName="title"))
+    titles.addWidget(QLabel(subtitle, objectName="subtitle"))
+    head.addLayout(titles, 1)
+    return head
+
+
+def _card(parent_layout, title):
+    frame = QFrame(objectName="card")
+    outer = QVBoxLayout(frame)
+    outer.setContentsMargins(16, 12, 16, 14)
+    outer.setSpacing(8)
+    outer.addWidget(QLabel(title.upper(), objectName="cardTitle"))
+    form = QFormLayout()
+    form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+    form.setHorizontalSpacing(18)
+    form.setVerticalSpacing(8)
+    outer.addLayout(form)
+    parent_layout.addWidget(frame)
+    return form, outer
+
+
+def _bring_to_front(w):
+    w.show()
+    w.raise_()
+    w.activateWindow()
+
+
+# --------------------------------------------------------------------------- #
+# Settings window
+# --------------------------------------------------------------------------- #
+class SettingsDialog(QDialog):
+    """A friendly settings window; writes config.json and tells the service."""
+
+    def __init__(self, on_saved=None, on_preview=None, on_stats=None, on_quit=None):
+        super().__init__(None, Qt.Dialog | Qt.WindowStaysOnTopHint | Qt.WindowCloseButtonHint)
+        self.on_saved = on_saved
+        self.on_quit = on_quit
+        self.setWindowTitle(f"{APP_NAME} – Settings")
+        self.setWindowIcon(drop_icon())
+        self.setStyleSheet(APP_QSS)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        cfg = load_config()
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 18)
+        root.setSpacing(12)
+        root.addLayout(_header("Settings", "Make your hydration buddy fit your day."))
+        cols = QHBoxLayout()
+        cols.setSpacing(12)
+        left, right = QVBoxLayout(), QVBoxLayout()
+        left.setSpacing(12)
+        right.setSpacing(12)
+        cols.addLayout(left, 1)
+        cols.addLayout(right, 1)
+        root.addLayout(cols)
+
+        def spin(lo, hi, step, suffix, value):
+            sb = QSpinBox()
+            sb.setRange(lo, hi)
+            sb.setSingleStep(step)
+            sb.setSuffix(suffix)
+            sb.setValue(int(clamp(int(value), lo, hi)))
+            sb.setButtonSymbols(QAbstractSpinBox.NoButtons)
+            sb.setAlignment(Qt.AlignCenter)
+            sb.setFixedWidth(110)
+            return sb
+
+        def stepper(sb):
+            box = QWidget()
+            lay = QHBoxLayout(box)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(6)
+            minus, plus = QPushButton("−", objectName="step"), QPushButton("+", objectName="step")
+            for b, fn in ((minus, sb.stepDown), (plus, sb.stepUp)):
+                b.setAutoRepeat(True)
+                b.clicked.connect(fn)
+            lay.addWidget(minus)
+            lay.addWidget(sb)
+            lay.addWidget(plus)
+            lay.addStretch(1)
+            return box
+
+        def label(text):
+            lb = QLabel(text)
+            lb.setMinimumWidth(140)
+            lb.setMinimumHeight(32)
+            lb.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            return lb
+
+        # --- left column
+        f, _ = _card(left, "Reminders")
+        self.interval = spin(5, 240, 5, " min", cfg["interval_minutes"])
+        self.snooze = spin(1, 120, 1, " min", cfg["snooze_minutes"])
+        self.autohide = spin(1, 30, 1, " min", cfg["auto_hide_minutes"])
+        f.addRow(label("Remind me every"), stepper(self.interval))
+        f.addRow(label("Snooze for"), stepper(self.snooze))
+        f.addRow(label("Hide if ignored after"), stepper(self.autohide))
+
+        f, outer = _card(left, "Daily goal")
+        self.goal = spin(1, 24, 1, " glasses", cfg["daily_goal_glasses"])
+        self.glass = spin(50, 1000, 50, " ml", cfg["glass_ml"])
+        f.addRow(label("Glasses per day"), stepper(self.goal))
+        f.addRow(label("Glass size"), stepper(self.glass))
+        self.total = QLabel(objectName="hint")
+        outer.addWidget(self.total)
+        self.goal.valueChanged.connect(self._update_total)
+        self.glass.valueChanged.connect(self._update_total)
+        self._update_total()
+        left.addStretch(1)
+
+        # --- right column
+        f, _ = _card(right, "Focus & quiet time")
+        q = cfg.get("quiet_hours") or {}
+        self.quiet = QCheckBox("Quiet hours at night")
+        self.quiet.setChecked(bool(q.get("enabled", True)))
+        self.q_start = QTimeEdit(QTime.fromString(q.get("start", "22:00"), "HH:mm"))
+        self.q_end = QTimeEdit(QTime.fromString(q.get("end", "08:00"), "HH:mm"))
+        for te in (self.q_start, self.q_end):
+            te.setDisplayFormat("HH:mm")
+            te.setButtonSymbols(QAbstractSpinBox.NoButtons)
+            te.setAlignment(Qt.AlignCenter)
+            te.setFixedWidth(76)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(self.q_start)
+        row.addWidget(QLabel("to"))
+        row.addWidget(self.q_end)
+        row.addStretch(1)
+        f.addRow(self.quiet)
+        f.addRow(label("No reminders from"), row)
+        self.quiet.toggled.connect(self._update_enabled)
+        self.focus = QCheckBox("Don't interrupt full-screen apps,\npresentations, calls or Do Not Disturb")
+        self.focus.setChecked(bool(cfg.get("respect_focus", True)))
+        f.addRow(self.focus)
+        self.away = QCheckBox("Pause while I'm away from the computer")
+        self.away.setChecked(bool(cfg.get("pause_when_away", True)))
+        self.away_min = spin(2, 60, 1, " min", cfg.get("away_minutes", 5))
+        f.addRow(self.away)
+        f.addRow(label("Away after no input for"), stepper(self.away_min))
+        self.away.toggled.connect(self._update_enabled)
+        self._update_enabled()
+
+        f, _ = _card(right, "Personal")
+        self.name = QLineEdit(cfg.get("name", ""))
+        self.name.setPlaceholderText(user_first_name({}))
+        self.sound = QCheckBox("Play a sound")
+        self.sound.setChecked(bool(cfg.get("sound", True)))
+        test = QPushButton("▶ Test")
+        test.clicked.connect(lambda: play_sound("reminder"))
+        srow = QHBoxLayout()
+        srow.addWidget(self.sound)
+        srow.addStretch(1)
+        srow.addWidget(test)
+        self.login = QCheckBox("Start automatically when I log in")
+        self._login_was = autostart_is_enabled()
+        self.login.setChecked(self._login_was)
+        f.addRow(label("Your name"), self.name)
+        f.addRow(srow)
+        f.addRow(self.login)
+        right.addStretch(1)
+
+        # --- footer
+        btns = QHBoxLayout()
+        reset = QPushButton("Reset to defaults", objectName="flat")
+        reset.clicked.connect(self._reset)
+        btns.addWidget(reset)
+        if on_quit:
+            unin = QPushButton("Uninstall…", objectName="flat")
+            unin.clicked.connect(self._uninstall)
+            btns.addWidget(unin)
+        ver = QLabel(f"v{APP_VERSION}", objectName="hint")
+        btns.addWidget(ver)
+        btns.addStretch(1)
+        if on_stats:
+            st = QPushButton("History && stats")
+            st.clicked.connect(on_stats)
+            btns.addWidget(st)
+        if on_preview:
+            prev = QPushButton("Preview")
+            prev.clicked.connect(on_preview)
+            btns.addWidget(prev)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("Save", objectName="primary")
+        save.setDefault(True)
+        save.clicked.connect(self._save)
+        btns.addWidget(cancel)
+        btns.addWidget(save)
+        root.addSpacing(2)
+        root.addLayout(btns)
+
+    def _update_total(self):
+        litres = self.goal.value() * self.glass.value() / 1000
+        tip = "  ·  most adults need about 2–3 L a day" if litres < 1.5 else ""
+        self.total.setText(f"= {litres:g} L per day{tip}")
+
+    def _update_enabled(self):
+        for w in (self.q_start, self.q_end):
+            w.setEnabled(self.quiet.isChecked())
+        self.away_min.setEnabled(self.away.isChecked())
+
+    def _reset(self):
+        d = DEFAULTS
+        self.interval.setValue(d["interval_minutes"])
+        self.snooze.setValue(d["snooze_minutes"])
+        self.autohide.setValue(d["auto_hide_minutes"])
+        self.goal.setValue(d["daily_goal_glasses"])
+        self.glass.setValue(d["glass_ml"])
+        self.quiet.setChecked(d["quiet_hours"]["enabled"])
+        self.q_start.setTime(QTime.fromString(d["quiet_hours"]["start"], "HH:mm"))
+        self.q_end.setTime(QTime.fromString(d["quiet_hours"]["end"], "HH:mm"))
+        self.focus.setChecked(d["respect_focus"])
+        self.away.setChecked(d["pause_when_away"])
+        self.away_min.setValue(d["away_minutes"])
+        self.name.setText("")
+        self.sound.setChecked(d["sound"])
+        self.login.setChecked(True)
+
+    def values(self):
+        cfg = load_config()  # keep any keys we don't show here
+        cfg.update({
+            "interval_minutes": self.interval.value(),
+            "snooze_minutes": self.snooze.value(),
+            "auto_hide_minutes": self.autohide.value(),
+            "daily_goal_glasses": self.goal.value(),
+            "glass_ml": self.glass.value(),
+            "quiet_hours": {"enabled": self.quiet.isChecked(),
+                            "start": self.q_start.time().toString("HH:mm"),
+                            "end": self.q_end.time().toString("HH:mm")},
+            "respect_focus": self.focus.isChecked(),
+            "pause_when_away": self.away.isChecked(),
+            "away_minutes": self.away_min.value(),
+            "sound": self.sound.isChecked(),
+            "name": self.name.text().strip(),
+        })
+        return cfg
+
+    def _save(self):
+        cfg = self.values()
+        cfg["autostart_configured"] = True
+        save_config(cfg)
+        if self.login.isChecked() != self._login_was:
+            try:
+                autostart_enable() if self.login.isChecked() else autostart_disable()
+            except Exception as e:
+                print(f"[{APP_ID}] could not change start-at-login: {e}", file=sys.stderr)
+        if self.on_saved:
+            self.on_saved(cfg)
+        self.accept()
+
+    def _uninstall(self):
+        from PySide6.QtWidgets import QMessageBox
+        msg = ("Remove Water Reminder from this computer?\n\n"
+               "It will stop, and won't start at login any more. Your history is kept.")
+        if IS_MAC and IS_FROZEN:
+            msg += "\n\nAfterwards, drag Water Reminder from Applications to the Trash."
+        if QMessageBox.question(self, "Uninstall Water Reminder", msg) != QMessageBox.Yes:
+            return
+        do_uninstall(purge=False, quiet=True)
+        self.reject()
+        if self.on_quit:
+            self.on_quit()
+
+
+# --------------------------------------------------------------------------- #
+# History & stats window
+# --------------------------------------------------------------------------- #
+ACHIEVEMENTS = [
+    ("💧", "First sip", "Log your first glass", lambda s: s["total"] >= 1),
+    ("🎯", "Goal getter", "Reach your daily goal", lambda s: s["days_met"] >= 1),
+    ("🌅", "Early bird", "A glass before 9:00", lambda s: s["early"]),
+    ("⭐", "Overachiever", "Beat your goal by 2+", lambda s: s["overachiever"]),
+    ("🔥", "On a roll", "3-day streak", lambda s: s["best"] >= 3),
+    ("🚀", "Unstoppable", "7-day streak", lambda s: s["best"] >= 7),
+    ("💯", "Century", "100 glasses in total", lambda s: s["total"] >= 100),
+    ("🏆", "Hydration hero", "30-day streak", lambda s: s["best"] >= 30),
+]
+
+
+def compute_stats(st=None, goal=None):
+    st = st or load_state()
+    goal = goal or max(1, int(load_config()["daily_goal_glasses"]))
+    hist = dict(st.get("history", {}))
+    hist[st["date"]] = st["count"]
+    today = datetime.date.today()
+    one = datetime.timedelta(days=1)
+
+    def count(d):
+        return hist.get(d.isoformat(), 0)
+
+    streak, d = 0, (today if count(today) >= goal else today - one)
+    while count(d) >= goal:
+        streak += 1
+        d -= one
+    best, run, prev = 0, 0, None
+    for k in sorted(hist):
+        day = datetime.date.fromisoformat(k)
+        if hist[k] >= goal:
+            run = run + 1 if prev is not None and day - prev == one else 1
+            prev = day
+            best = max(best, run)
+        else:
+            run, prev = 0, None
+    best = max(best, streak)
+    week = [count(today - i * one) for i in range(7)]
+    times = st.get("times", {})
+    total = st.get("total", sum(hist.values()))
+    return {
+        "today": st["count"], "goal": goal, "streak": streak, "best": best,
+        "avg7": sum(week) / 7.0, "total": max(total, sum(hist.values())),
+        "days_met": sum(1 for v in hist.values() if v >= goal),
+        "early": any(t < "09:00" for ts in times.values() for t in ts),
+        "overachiever": any(v >= goal + 2 for v in hist.values()),
+        "hist": hist,
+    }
+
+
+class BarChart(QWidget):
+    """Glasses per day vs. the goal line. One series: no legend; a small key explains the two shades."""
+    MET = QColor("#1a70f0")
+    BELOW = QColor("#9cc6f7")
+    INK = QColor("#1b2b44")
+    MUTED = QColor("#6b7a8f")
+    GRID = QColor("#e3ecf7")
+
+    def __init__(self):
+        super().__init__()
+        self.days = 7
+        self.data = []
+        self.goal = 8
+        self.ml = 250
+        self.hover = -1
+        self.setMouseTracking(True)
+        self.setMinimumHeight(200)
+
+    def set_data(self, hist, goal, ml, days):
+        self.goal, self.ml, self.days = goal, ml, days
+        today = datetime.date.today()
+        self.data = [(today - datetime.timedelta(days=i), hist.get((today - datetime.timedelta(days=i)).isoformat(), 0))
+                     for i in range(days - 1, -1, -1)]
+        self.update()
+
+    def _geom(self):
+        left, right, top, bottom = 30, 56, 14, 26
+        w, h = self.width() - left - right, self.height() - top - bottom
+        ymax = max([self.goal + 1] + [c + 1 for _, c in self.data])
+        ymax = int(math.ceil(ymax / 2.0) * 2)
+        slot = w / max(1, len(self.data))
+        return left, top, w, h, ymax, slot
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        left, top, w, h, ymax, slot = self._geom()
+        base = top + h
+        small = make_font(11)
+        p.setFont(small)
+        # recessive grid + y labels
+        step = 2 if ymax <= 12 else 4
+        for v in range(0, ymax + 1, step):
+            y = base - h * v / ymax
+            p.setPen(QPen(self.GRID, 1))
+            p.drawLine(QPointF(left, y), QPointF(left + w, y))
+            p.setPen(self.MUTED)
+            p.drawText(QRectF(0, y - 8, left - 6, 16), int(Qt.AlignRight | Qt.AlignVCenter), str(v))
+        # bars: thin, rounded data-end (top), square at the baseline
+        bw = max(4.0, min(28.0, slot * 0.58))
+        for i, (day, c) in enumerate(self.data):
+            x = left + slot * i + (slot - bw) / 2
+            col = QColor(self.MET if c >= self.goal else self.BELOW)
+            if i == self.hover:
+                col = col.darker(115)
+            if c > 0:
+                bh = h * c / ymax
+                path = QPainterPath()
+                r = min(4.0, bw / 2, bh)
+                path.moveTo(x, base)
+                path.lineTo(x, base - bh + r)
+                path.quadTo(x, base - bh, x + r, base - bh)
+                path.lineTo(x + bw - r, base - bh)
+                path.quadTo(x + bw, base - bh, x + bw, base - bh + r)
+                path.lineTo(x + bw, base)
+                path.closeSubpath()
+                fill(p, path, col)
+            # x labels (thinned for 30 days)
+            is_today = i == len(self.data) - 1
+            if self.days <= 14 or day.day % 5 == 0 or is_today:
+                lbl = "Today" if is_today else (day.strftime("%a")[:2] if self.days <= 7 else str(day.day))
+                p.setPen(self.INK if is_today else self.MUTED)
+                p.setFont(make_font(11, is_today))
+                p.drawText(QRectF(left + slot * i - 10, base + 6, slot + 20, 16), int(Qt.AlignHCenter), lbl)
+        # selective direct label: today's value
+        if self.data:
+            c = self.data[-1][1]
+            x = left + slot * (len(self.data) - 1)
+            y = base - h * c / ymax
+            p.setFont(make_font(11, True))
+            p.setPen(self.INK)
+            p.drawText(QRectF(x - 10, y - 18, slot + 20, 16), int(Qt.AlignHCenter), str(c))
+        # goal reference line (neutral ink, dashed) + label
+        gy = base - h * self.goal / ymax
+        pen = QPen(self.INK, 1.5, Qt.DashLine)
+        pen.setDashPattern([4, 3])
+        p.setPen(pen)
+        p.drawLine(QPointF(left, gy), QPointF(left + w, gy))
+        p.setFont(make_font(11, True))
+        p.setPen(self.INK)
+        p.drawText(QRectF(left + w + 6, gy - 8, 50, 16), int(Qt.AlignLeft | Qt.AlignVCenter), f"Goal {self.goal}")
+        p.end()
+
+    def _index_at(self, x):
+        left, _, w, _, _, slot = self._geom()
+        if x < left or x > left + w:
+            return -1
+        return min(len(self.data) - 1, int((x - left) // slot))
+
+    def mouseMoveEvent(self, ev):
+        from PySide6.QtWidgets import QToolTip
+        i = self._index_at(ev.position().x())
+        if i != self.hover:
+            self.hover = i
+            self.update()
+        if i >= 0:
+            day, c = self.data[i]
+            status = "goal met ✓" if c >= self.goal else f"{self.goal - c} short of goal"
+            QToolTip.showText(ev.globalPosition().toPoint(),
+                              f"{day.strftime('%a %d %b')}\n{c} glasses · {c * self.ml / 1000:g} L\n{status}", self)
+        else:
+            QToolTip.hideText()
+
+    def leaveEvent(self, _ev):
+        self.hover = -1
+        self.update()
+
+
+class StatsDialog(QDialog):
+    def __init__(self, on_log=None, on_undo=None):
+        super().__init__(None, Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.on_log, self.on_undo = on_log, on_undo
+        self.setWindowTitle(f"{APP_NAME} – History & stats")
+        self.setWindowIcon(drop_icon())
+        self.setStyleSheet(APP_QSS)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setMinimumWidth(780)
+        self.range_days = 7
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 18)
+        root.setSpacing(12)
+        root.addLayout(_header("Your hydration", datetime.date.today().strftime("Today is %A, %d %B")))
+
+        tiles = QHBoxLayout()
+        tiles.setSpacing(10)
+        self.kpis = {}
+        for key, label in (("today", "today"), ("streak", "day streak 🔥"), ("best", "best streak"),
+                           ("avg", "glasses/day, last 7 days")):
+            frame = QFrame(objectName="tile")
+            lay = QVBoxLayout(frame)
+            lay.setContentsMargins(14, 10, 14, 10)
+            lay.setSpacing(0)
+            val = QLabel("–", objectName="kpi")
+            lay.addWidget(val)
+            lay.addWidget(QLabel(label, objectName="kpiLabel"))
+            self.kpis[key] = val
+            tiles.addWidget(frame, 1)
+        root.addLayout(tiles)
+
+        chart_card = QFrame(objectName="card")
+        cl = QVBoxLayout(chart_card)
+        cl.setContentsMargins(16, 12, 16, 12)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("GLASSES PER DAY", objectName="cardTitle"))
+        top.addStretch(1)
+        self.seg = []
+        for d in (7, 14, 30):
+            b = QPushButton(f"{d} days", objectName="seg")
+            b.setCheckable(True)
+            b.setChecked(d == 7)
+            b.clicked.connect(lambda _c=False, d=d: self._set_range(d))
+            top.addWidget(b)
+            self.seg.append((d, b))
+        cl.addLayout(top)
+        self.chart = BarChart()
+        cl.addWidget(self.chart)
+        key = QLabel(objectName="hint")
+        key.setTextFormat(Qt.RichText)
+        key.setText('<span style="color:#1a70f0">■</span> goal met &nbsp;&nbsp; '
+                    '<span style="color:#9cc6f7">■</span> below goal &nbsp;&nbsp; '
+                    '<span style="color:#1b2b44">┄</span> daily goal &nbsp;&nbsp; · hover a bar for details')
+        cl.addWidget(key)
+        root.addWidget(chart_card)
+
+        ach_card = QFrame(objectName="card")
+        al = QVBoxLayout(ach_card)
+        al.setContentsMargins(16, 12, 16, 14)
+        self.ach_title = QLabel("ACHIEVEMENTS", objectName="cardTitle")
+        al.addWidget(self.ach_title)
+        from PySide6.QtWidgets import QGraphicsOpacityEffect, QGridLayout
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        self.badges = []
+        for i, (emoji, title, desc, _test) in enumerate(ACHIEVEMENTS):
+            b = QFrame(objectName="badge")
+            bl = QHBoxLayout(b)
+            bl.setContentsMargins(10, 8, 10, 8)
+            ic = QLabel(emoji, objectName="badgeIcon")
+            bl.addWidget(ic)
+            tl = QVBoxLayout()
+            tl.setSpacing(0)
+            tl.addWidget(QLabel(title, objectName="badgeTitle"))
+            dl = QLabel(desc, objectName="badgeDesc")
+            dl.setWordWrap(True)
+            tl.addWidget(dl)
+            bl.addLayout(tl, 1)
+            eff = QGraphicsOpacityEffect(b)
+            b.setGraphicsEffect(eff)
+            grid.addWidget(b, i // 4, i % 4)
+            self.badges.append((eff, _test))
+        al.addLayout(grid)
+        root.addWidget(ach_card)
+
+        btns = QHBoxLayout()
+        self.undo_btn = QPushButton("Undo last glass")
+        self.undo_btn.clicked.connect(self._undo)
+        log = QPushButton("+ Log a glass")
+        log.clicked.connect(self._log)
+        btns.addWidget(self.undo_btn)
+        btns.addWidget(log)
+        btns.addStretch(1)
+        close = QPushButton("Close", objectName="primary")
+        close.clicked.connect(self.accept)
+        btns.addWidget(close)
+        root.addLayout(btns)
+        self.refresh()
+
+    def _set_range(self, d):
+        self.range_days = d
+        for dd, b in self.seg:
+            b.setChecked(dd == d)
+        self.refresh()
+
+    def refresh(self):
+        cfg = load_config()
+        s = compute_stats(goal=max(1, int(cfg["daily_goal_glasses"])))
+        self.kpis["today"].setText(f"{s['today']}/{s['goal']}")
+        self.kpis["streak"].setText(str(s["streak"]))
+        self.kpis["best"].setText(str(s["best"]))
+        self.kpis["avg"].setText(f"{s['avg7']:.1f}")
+        self.chart.set_data(s["hist"], s["goal"], int(cfg["glass_ml"]), self.range_days)
+        unlocked = 0
+        for eff, test in self.badges:
+            ok = bool(test(s))
+            unlocked += ok
+            eff.setOpacity(1.0 if ok else 0.35)
+        self.ach_title.setText(f"ACHIEVEMENTS · {unlocked}/{len(self.badges)}")
+        self.undo_btn.setEnabled(s["today"] > 0)
+
+    def _log(self):
+        (self.on_log or record_glass)()
+        self.refresh()
+
+    def _undo(self):
+        (self.on_undo or undo_glass)()
+        self.refresh()
+
+
+# --------------------------------------------------------------------------- #
+# Background service: smart scheduling + tray icon
+# --------------------------------------------------------------------------- #
 class Service:
+    HEARTBEAT_MS = 15000
+    LONG_BREAK = 15 * 60  # away at least this long -> "welcome back" reminder
+
     def __init__(self, app, once=False):
         self.app = app
         self.once = once
         self.overlay = None
-        self.next_at = None
+        self.due_at = None
         self.paused_until = None
-        self.timer = QTimer()
-        self.timer.setSingleShot(True)
-        self.timer.timeout.connect(lambda: self._fire(False))
+        self.away = False
+        self.away_since = None
+        self.frozen_remaining = None
+        self.waiting_reason = None
+        self.intro = None
+        self.settings_dlg = None
+        self.stats_dlg = None
         self.tray = None
-        if not once and QSystemTrayIcon.isSystemTrayAvailable():
-            self._make_tray()
+        self._last_beat = time.monotonic()
+        self._last_wall = time.time()
+        self.precise = QTimer()
+        self.precise.setSingleShot(True)
+        self.precise.timeout.connect(self._heartbeat)
+        if not once:
+            self.beat = QTimer()
+            self.beat.timeout.connect(self._heartbeat)
+            self.beat.start(self.HEARTBEAT_MS)
+            if QSystemTrayIcon.isSystemTrayAvailable():
+                self._make_tray()
 
-    # scheduling
+    # -- scheduling -------------------------------------------------------------
     def schedule(self, minutes):
-        minutes = max(0.05, float(minutes))
-        self.timer.start(int(minutes * 60000))
-        self.next_at = datetime.datetime.now() + datetime.timedelta(minutes=minutes)
-        print(f"[{APP_ID}] next reminder at {self.next_at:%H:%M}", flush=True)
+        minutes = max(0.02, float(minutes))
+        self.due_at = datetime.datetime.now() + datetime.timedelta(minutes=minutes)
+        self.precise.start(int(minutes * 60000) + 200)
+        print(f"[{APP_ID}] next reminder at {self.due_at:%H:%M:%S}", flush=True)
         self._refresh_tray()
 
-    def _fire(self, force):
-        cfg = load_config()
+    def _heartbeat(self):
+        if self.once:
+            return
         now = datetime.datetime.now()
+        cfg = load_config()
+        # A big gap between heartbeats means the computer was asleep.
+        gap = time.time() - self._last_wall
+        self._last_wall = time.time()
+        if gap > 180 and self.overlay is None and not self.away:
+            print(f"[{APP_ID}] woke up after {gap / 60:.0f} min", flush=True)
+            self.away, self.away_since = True, now - datetime.timedelta(seconds=gap)
+            self.frozen_remaining = None
+        if cfg.get("pause_when_away", True):
+            idle = Probes.idle_seconds()
+            limit = max(60, float(cfg.get("away_minutes", 5)) * 60)
+            if idle is not None and not self.away and idle >= limit and self.overlay is None:
+                self.away = True
+                self.away_since = now - datetime.timedelta(seconds=idle)
+                self.frozen_remaining = ((self.due_at - now).total_seconds() if self.due_at else None)
+                self.precise.stop()
+                print(f"[{APP_ID}] you seem to be away – pausing", flush=True)
+                self._refresh_tray()
+            elif self.away and (idle is None or idle < 30):
+                self._came_back((now - self.away_since).total_seconds())
+        elif self.away:
+            self._came_back((now - self.away_since).total_seconds())
+        if self.away:
+            return
+        if self.paused_until and now >= self.paused_until:
+            self.paused_until = None
+        if self.overlay is None and self.due_at and now >= self.due_at:
+            self._try_show(cfg)
+
+    def _came_back(self, away_seconds):
+        cfg = load_config()
+        self.away, self.away_since = False, None
+        if away_seconds >= self.LONG_BREAK:
+            print(f"[{APP_ID}] welcome back (away {away_seconds / 60:.0f} min)", flush=True)
+            self.intro = "welcome"
+            self.schedule(1)
+        else:
+            rem = self.frozen_remaining
+            self.schedule(rem / 60 if rem and rem > 0 else 0.5 if rem is not None else cfg["interval_minutes"])
+        self.frozen_remaining = None
+
+    def _try_show(self, cfg=None, force=False):
+        cfg = cfg or load_config()
         if not force:
-            if self.paused_until and now < self.paused_until:
-                self.schedule((self.paused_until - now).total_seconds() / 60 + 0.1)
-                return
             if in_quiet_hours(cfg):
+                self.intro = None
                 self.schedule(cfg["interval_minutes"])
                 return
+            if cfg.get("respect_focus", True):
+                reason = Probes.busy_reason()
+                if reason:
+                    if reason != self.waiting_reason:
+                        print(f"[{APP_ID}] waiting – {reason}", flush=True)
+                        self.waiting_reason = reason
+                        self._refresh_tray()
+                    return  # try again on the next heartbeat
+        self.waiting_reason = None
         self.paused_until = None
         self.show(cfg)
 
@@ -1344,10 +2604,13 @@ class Service:
         if self.overlay is not None:
             return
         cfg = cfg or load_config()
-        self.timer.stop()
+        self.precise.stop()
+        self.due_at = None
         if cfg.get("sound", True):
             play_sound("reminder")
-        self.overlay = Overlay(cfg, load_state()["count"], self._done)
+        intro, self.intro = self.intro, None
+        self.overlay = Overlay(cfg, load_state()["count"], self._done, self.open_settings, intro=intro)
+        self._refresh_tray()
 
     def _done(self, result):
         self.overlay = None
@@ -1360,49 +2623,94 @@ class Service:
         self.schedule(cfg["snooze_minutes"] if result == "snooze" else cfg["interval_minutes"])
 
     def log_glass(self):
-        st = load_state()
-        st["count"] += 1
-        save_state(st)
+        record_glass()
+        self._refresh_tray()
+        if self.stats_dlg is not None and self.stats_dlg.isVisible():
+            self.stats_dlg.refresh()
+
+    def undo_glass(self):
+        undo_glass()
         self._refresh_tray()
 
     def command(self, cmd):
         cmd = cmd.strip()
         if cmd == "show":
-            self._fire(True)
+            self._try_show(force=True)
+        elif cmd == "welcome":
+            self.intro = "hello"
+            self._try_show(force=True)
+        elif cmd == "settings":
+            self.open_settings()
+        elif cmd == "stats":
+            self.open_stats()
         elif cmd == "quit":
             self.app.quit()
 
-    # tray
+    # -- windows ---------------------------------------------------------------
+    def open_settings(self):
+        if self.settings_dlg is not None and self.settings_dlg.isVisible():
+            _bring_to_front(self.settings_dlg)
+            return
+        self.settings_dlg = SettingsDialog(on_saved=self._settings_saved, on_preview=lambda: self._try_show(force=True),
+                                           on_stats=self.open_stats, on_quit=self.app.quit)
+        _bring_to_front(self.settings_dlg)
+
+    def open_stats(self):
+        if self.stats_dlg is not None and self.stats_dlg.isVisible():
+            self.stats_dlg.refresh()
+            _bring_to_front(self.stats_dlg)
+            return
+        self.stats_dlg = StatsDialog(on_log=self.log_glass, on_undo=self.undo_glass)
+        _bring_to_front(self.stats_dlg)
+
+    def _settings_saved(self, cfg):
+        if self.overlay is None and not self.paused_until and not self.once:
+            self.schedule(cfg["interval_minutes"])
+        self._refresh_tray()
+
+    # -- tray --------------------------------------------------------------------
     def _make_tray(self):
         self.tray = QSystemTrayIcon(drop_icon(), self.app)
         menu = QMenu()
-        self.a_now = QAction("Remind me now", menu, triggered=lambda: self._fire(True))
+        self.a_now = QAction("Remind me now", menu, triggered=lambda: self._try_show(force=True))
         self.a_log = QAction("Log a glass", menu, triggered=self.log_glass)
+        self.a_undo = QAction("Undo last glass", menu, triggered=self.undo_glass)
         self.a_today = QAction("", menu, enabled=False)
         self.a_next = QAction("", menu, enabled=False)
+        self.a_stats = QAction("History & stats…", menu, triggered=self.open_stats)
         self.a_pause = QAction("Pause for 1 hour", menu, triggered=self._toggle_pause)
-        self.a_settings = QAction("Settings…", menu, triggered=self._open_settings)
+        self.a_settings = QAction("Settings…", menu, triggered=self.open_settings)
         self.a_quit = QAction("Quit Water Reminder", menu, triggered=self.app.quit)
-        for a in (self.a_now, self.a_log, None, self.a_today, self.a_next, None, self.a_pause,
-                  self.a_settings, None, self.a_quit):
+        for a in (self.a_now, self.a_log, self.a_undo, None, self.a_today, self.a_next, None, self.a_stats,
+                  self.a_pause, self.a_settings, None, self.a_quit):
             menu.addSeparator() if a is None else menu.addAction(a)
         menu.aboutToShow.connect(self._refresh_tray)
         self._menu = menu
         self.tray.setContextMenu(menu)
+        self.tray.activated.connect(lambda r: self.open_stats() if r == QSystemTrayIcon.DoubleClick else None)
         self.tray.show()
         self._refresh_tray()
+
+    def status_text(self):
+        if self.overlay is not None:
+            return "Reminder on screen"
+        if self.away:
+            return "Paused – you're away"
+        if self.waiting_reason:
+            return f"Waiting – {self.waiting_reason}"
+        if self.paused_until:
+            return f"Paused until {self.paused_until:%H:%M}"
+        return f"Next reminder: {self.due_at:%H:%M}" if self.due_at else "Next reminder: –"
 
     def _refresh_tray(self):
         if not self.tray:
             return
         cfg, st = load_config(), load_state()
         today = f"Today: {st['count']}/{cfg['daily_goal_glasses']} glasses ({st['count'] * cfg['glass_ml']} ml)"
-        if self.paused_until:
-            nxt = f"Paused until {self.paused_until:%H:%M}"
-        else:
-            nxt = f"Next reminder: {self.next_at:%H:%M}" if self.next_at else "Next reminder: –"
+        nxt = self.status_text()
         self.a_today.setText(today)
         self.a_next.setText(nxt)
+        self.a_undo.setEnabled(st["count"] > 0)
         self.a_pause.setText("Resume reminders" if self.paused_until else "Pause for 1 hour")
         self.tray.setToolTip(f"{APP_NAME}\n{today}\n{nxt}")
 
@@ -1412,14 +2720,13 @@ class Service:
             self.schedule(load_config()["interval_minutes"])
         else:
             self.paused_until = datetime.datetime.now() + datetime.timedelta(hours=1)
-            self.schedule(60.1)
+            self.schedule(60)
         self._refresh_tray()
 
-    def _open_settings(self):
-        load_config()
-        QDesktopServices.openUrl(QUrl.fromLocalFile(CONFIG_FILE))
 
-
+# --------------------------------------------------------------------------- #
+# Single instance + commands (--now, --settings, ...) over a local socket
+# --------------------------------------------------------------------------- #
 def send_command(cmd, timeout=800):
     sock = QLocalSocket()
     sock.connectToServer(SERVER_NAME)
@@ -1452,28 +2759,8 @@ def start_server(service):
 
 
 # --------------------------------------------------------------------------- #
-# Install / uninstall (start at login)
+# Install / uninstall
 # --------------------------------------------------------------------------- #
-MAC_PLIST = _home("Library", "LaunchAgents", "com.waterreminder.agent.plist")
-LINUX_AUTOSTART = os.path.join(os.environ.get("XDG_CONFIG_HOME") or _home(".config"), "autostart",
-                               "water-reminder.desktop")
-LINUX_LAUNCHER = os.path.join(os.environ.get("XDG_DATA_HOME") or _home(".local", "share"), "applications",
-                              "water-reminder.desktop")
-LINUX_BIN = _home(".local", "bin", "water-reminder")
-WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-WIN_START_MENU = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs",
-                              "Water Reminder.lnk")
-
-
-def _gui_python():
-    py = sys.executable
-    if IS_WIN:
-        pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
-        if os.path.exists(pyw):
-            return pyw
-    return py
-
-
 def _stop_old_linux_daemon():
     """Stop the earlier GTK-based version if it is running."""
     pid_file = os.path.join(DATA_DIR, "daemon.pid")
@@ -1489,115 +2776,120 @@ def _stop_old_linux_daemon():
             pass
 
 
+def _wait_and_welcome():
+    for _ in range(60):
+        time.sleep(0.25)
+        if send_command("welcome"):
+            return True
+    return False
+
+
 def do_install():
+    """Script install (used by install.sh / install.bat): copy, start at login, launch."""
     os.makedirs(APP_DIR, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
     src = os.path.abspath(__file__)
     dst = os.path.join(APP_DIR, "water_reminder.py")
     if os.path.abspath(src) != os.path.abspath(dst):
         shutil.copy2(src, dst)
-    load_config()
-    py = _gui_python()
-
+    cfg = load_config()
+    cmd = [_gui_python(), dst]
     if send_command("quit"):
         time.sleep(1.0)
-
-    if IS_WIN:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
-            winreg.SetValueEx(key, "WaterReminder", 0, winreg.REG_SZ, f'"{py}" "{dst}"')
-        ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{WIN_START_MENU}');"
-              f"$s.TargetPath='{py}';$s.Arguments='\"{dst}\" --now';"
-              f"$s.Description='Show the water reminder now';$s.Save()")
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True)
-        subprocess.Popen([py, dst], creationflags=0x00000008 | 0x00000200, close_fds=True)  # detached
-    elif IS_MAC:
-        os.makedirs(os.path.dirname(MAC_PLIST), exist_ok=True)
-        with open(MAC_PLIST, "w") as f:
-            f.write(f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.waterreminder.agent</string>
-  <key>ProgramArguments</key>
-  <array><string>{py}</string><string>{dst}</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>LimitLoadToSessionType</key><string>Aqua</string>
-  <key>StandardOutPath</key><string>{LOG_FILE}</string>
-  <key>StandardErrorPath</key><string>{LOG_FILE}</string>
-</dict>
-</plist>
-""")
-        subprocess.run(["launchctl", "unload", MAC_PLIST], capture_output=True)
-        subprocess.run(["launchctl", "load", "-w", MAC_PLIST], capture_output=True)
-    else:
+    if IS_LINUX:
         _stop_old_linux_daemon()
-        for path in (LINUX_AUTOSTART, LINUX_LAUNCHER, LINUX_BIN):
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(LINUX_BIN, "w") as f:
-            f.write(f'#!/bin/sh\nexec "{py}" "{dst}" "$@"\n')
-        os.chmod(LINUX_BIN, 0o755)
-        entry = ("[Desktop Entry]\nType=Application\nName=Water Reminder\nIcon=weather-showers\n"
-                 "Categories=Utility;\nKeywords=water;drink;hydration;reminder;\n")
-        with open(LINUX_AUTOSTART, "w") as f:
-            f.write(entry + f"Comment=Animated reminder to drink water\nExec={LINUX_BIN}\n"
-                            "X-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Delay=20\n")
-        with open(LINUX_LAUNCHER, "w") as f:
-            f.write(entry + f"Comment=Show the water reminder now\nExec={LINUX_BIN} --now\n")
-        with open(LOG_FILE, "a") as log:
-            subprocess.Popen([py, dst], stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
-
-    # wait for the service, then show a first reminder as a demo
-    for _ in range(40):
-        time.sleep(0.25)
-        if send_command("show"):
-            break
-    cfg = load_config()
+    autostart_enable(cmd)
+    create_shortcuts(cmd)
+    cfg["autostart_configured"] = True
+    save_config(cfg)
+    if IS_MAC:
+        _run(["launchctl", "unload", MAC_PLIST])
+        _run(["launchctl", "load", "-w", MAC_PLIST])
+    else:
+        spawn_detached(cmd)
+    _wait_and_welcome()
     print(f"\nInstalled! A water drop will visit every {cfg['interval_minutes']} minutes "
           f"and it starts automatically when you log in.")
-    print(f"  Settings: {CONFIG_FILE}")
-    if not IS_WIN:
-        print(f"  Show now: {'water-reminder' if IS_LINUX else 'python3 ' + repr(dst)} --now")
-    print("  Tip: the water-drop icon in your " + ("menu bar" if IS_MAC else "system tray") +
-          " has 'Remind me now', 'Pause' and 'Settings'.")
+    print("  Use the water-drop icon in your " + ("menu bar" if IS_MAC else "system tray") +
+          " for Settings and History & stats.")
+    if IS_LINUX:
+        print("  Or run: water-reminder --settings   /   water-reminder --stats")
     return 0
 
 
-def do_uninstall(purge):
-    send_command("quit")
-    if IS_WIN:
+def frozen_first_run():
+    """Packaged app (.exe / Linux binary / .app): install itself for this user.
+
+    Returns True if this process should exit (because an installed copy was started).
+    """
+    cfg = load_config()
+    if IS_MAC:
+        exe = sys.executable
+        if exe.startswith("/Volumes/") or "/AppTranslocation/" in exe:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(None, APP_NAME, "Please drag Water Reminder into your Applications "
+                                                    "folder first, then open it from there.")
+            return True
+        moved = False
+        if autostart_is_enabled():
+            with open(MAC_PLIST, "rb") as f:
+                moved = exe.encode() not in f.read()
+        if not cfg.get("autostart_configured") or moved:
+            autostart_enable([exe])
+            cfg["autostart_configured"] = True
+            save_config(cfg)
+            return "welcome"
+        return False
+
+    exe = os.path.abspath(sys.executable)
+    target = os.path.join(APP_DIR, "WaterReminder.exe" if IS_WIN else "WaterReminder")
+    if os.path.normcase(exe) == os.path.normcase(os.path.abspath(target)):
+        return False  # already running the installed copy
+    # A fresh download (or an update): replace the installed copy and start it.
+    if send_command("quit"):
+        time.sleep(1.5)
+    os.makedirs(APP_DIR, exist_ok=True)
+    for _ in range(20):
         try:
-            import winreg
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
-                winreg.DeleteValue(key, "WaterReminder")
+            shutil.copy2(exe, target)
+            break
         except OSError:
-            pass
-        for path in (WIN_START_MENU,):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-    elif IS_MAC:
-        subprocess.run(["launchctl", "unload", MAC_PLIST], capture_output=True)
-        try:
-            os.remove(MAC_PLIST)
-        except OSError:
-            pass
+            time.sleep(0.5)
     else:
+        return False  # couldn't copy: just run from here
+    if not IS_WIN:
+        os.chmod(target, 0o755)
+    if IS_LINUX:
         _stop_old_linux_daemon()
-        for path in (LINUX_AUTOSTART, LINUX_LAUNCHER, LINUX_BIN):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-    try:
-        os.remove(os.path.join(APP_DIR, "water_reminder.py"))
-    except OSError:
-        pass
+    if not cfg.get("autostart_configured") or autostart_is_enabled():
+        autostart_enable([target])
+    create_shortcuts([target])
+    cfg["autostart_configured"] = True
+    save_config(cfg)
+    spawn_detached([target, "--welcome"])
+    return True
+
+
+def do_uninstall(purge=False, quiet=False):
+    send_command("quit")
+    autostart_disable()
+    remove_shortcuts()
+    if IS_MAC:
+        _run(["launchctl", "unload", MAC_PLIST])
+    if IS_LINUX:
+        _stop_old_linux_daemon()
+    if IS_FROZEN and IS_WIN:
+        # can't delete a running .exe: remove the folder shortly after we exit
+        subprocess.Popen(f'cmd /c for /l %i in (1,1,15) do (ping -n 2 127.0.0.1 >nul '
+                         f'& if exist "{APP_DIR}" rmdir /s /q "{APP_DIR}" 2>nul)',
+                         creationflags=0x08000000, close_fds=True, cwd=os.path.dirname(APP_DIR))
+    else:
+        shutil.rmtree(APP_DIR, ignore_errors=True)
     if purge:
         shutil.rmtree(DATA_DIR, ignore_errors=True)
         shutil.rmtree(CONFIG_DIR, ignore_errors=True)
-    print("Water Reminder removed." + ("" if purge else " (Your history and settings were kept.)"))
+    if not quiet:
+        print("Water Reminder removed." + ("" if purge else " (Your history and settings were kept.)"))
     return 0
 
 
@@ -1606,25 +2898,32 @@ def print_status():
     if QCoreApplication.instance() is None:
         QCoreApplication(sys.argv)
     running = send_command("ping")
+    s = compute_stats(st, max(1, int(cfg["daily_goal_glasses"])))
     print(f"Today: {st['count']}/{cfg['daily_goal_glasses']} glasses ({st['count'] * cfg['glass_ml']} ml)")
-    print(f"Reminder service: {'running' if running else 'not running'}")
+    print(f"Streak: {s['streak']} days (best {s['best']})   7-day average: {s['avg7']:.1f} glasses/day")
+    print(f"Reminder service: {'running' if running else 'not running'}   Start at login: "
+          f"{'on' if autostart_is_enabled() else 'off'}")
     print(f"Interval: every {cfg['interval_minutes']} min   Config: {CONFIG_FILE}")
-    last = sorted(st["history"].items())[-7:]
-    if last:
-        print("Last days: " + "  ".join(f"{d[5:]}:{c}" for d, c in last))
     return 0
 
 
 # --------------------------------------------------------------------------- #
 def main():
+    if IS_FROZEN and sys.stdout is None:  # windowed build: keep a log instead of a console
+        os.makedirs(DATA_DIR, exist_ok=True)
+        sys.stdout = sys.stderr = open(LOG_FILE, "a", buffering=1, encoding="utf-8")
+
     ap = argparse.ArgumentParser(description="Animated water reminder")
     ap.add_argument("--now", action="store_true", help="show the reminder right now")
+    ap.add_argument("--settings", action="store_true", help="open the settings window")
+    ap.add_argument("--stats", action="store_true", help="open history & stats")
     ap.add_argument("--status", action="store_true", help="print today's progress")
     ap.add_argument("--stop", action="store_true", help="stop the background reminder")
     ap.add_argument("--install", action="store_true", help="start automatically at login")
     ap.add_argument("--uninstall", action="store_true", help="remove start-at-login")
     ap.add_argument("--purge", action="store_true", help="with --uninstall: also delete history/settings")
-    args = ap.parse_args()
+    ap.add_argument("--welcome", action="store_true", help=argparse.SUPPRESS)
+    args, _unknown = ap.parse_known_args()  # tolerate extra args (e.g. macOS -psn_...)
 
     if args.status:
         return print_status()
@@ -1641,9 +2940,30 @@ def main():
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+    app.setWindowIcon(drop_icon(128))
     app.setQuitOnLastWindowClosed(False)
     if IS_MAC:
         mac_hide_dock_icon()
+
+    for flag, cmd, dialog in ((args.settings, "settings", "settings"), (args.stats, "stats", "stats")):
+        if not flag:
+            continue
+        if send_command(cmd):
+            return 0
+        if dialog == "settings":
+            keep = []
+
+            def preview():
+                if not send_command("show") and not keep:
+                    keep.append(Overlay(load_config(), load_state()["count"], lambda _r: keep.clear()))
+            dlg = SettingsDialog(on_preview=preview)
+        else:
+            dlg = StatsDialog()
+        dlg.setAttribute(Qt.WA_DeleteOnClose, False)
+        _bring_to_front(dlg)
+        dlg.finished.connect(lambda _r: QTimer.singleShot(0, app.quit))
+        return app.exec()
 
     if args.now:
         if send_command("show"):
@@ -1652,17 +2972,27 @@ def main():
         svc.show()
         return app.exec()
 
+    welcome = args.welcome
+    if IS_FROZEN:
+        r = frozen_first_run()
+        if r is True:
+            return 0
+        welcome = welcome or r == "welcome"
+
     if send_command("ping"):
+        # Opened again while already running (e.g. double-clicked the app): show Settings.
+        send_command("welcome" if welcome else "settings")
         print(f"[{APP_ID}] already running.")
         return 0
     svc = Service(app)
-    server = start_server(svc)  # noqa: F841 (keep a reference)
+    svc.server = start_server(svc)  # keep a reference
     cfg = load_config()
-    print(f"[{APP_ID}] running - every {cfg['interval_minutes']} min "
+    print(f"[{APP_ID}] v{APP_VERSION} running - every {cfg['interval_minutes']} min "
           f"(quiet {cfg['quiet_hours']['start']}-{cfg['quiet_hours']['end']})", flush=True)
     svc.schedule(cfg["interval_minutes"])
+    if welcome:
+        QTimer.singleShot(1500, lambda: svc.command("welcome"))
 
-    # let Ctrl+C / SIGTERM stop the Qt event loop
     signal.signal(signal.SIGINT, lambda *_: app.quit())
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, lambda *_: app.quit())

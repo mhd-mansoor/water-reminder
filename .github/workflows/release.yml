@@ -1,0 +1,93 @@
+# Builds the one-click apps for Windows, macOS and Linux.
+#
+# - Every push / pull request: builds all three and keeps them as downloadable
+#   "artifacts" on the Actions run (handy for testing).
+# - Pushing a version tag (e.g. `git tag v1.2.0 && git push origin v1.2.0`)
+#   also publishes them on the repository's Releases page.
+name: Build apps
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows
+          - os: macos-latest        # Apple Silicon (M1 and newer)
+            label: macOS
+          - os: ubuntu-22.04        # older glibc = runs on more Linux versions
+            label: Linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Linux libraries Qt needs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-keysyms1 \
+            libxcb-shape0 libxcb-render-util0 libxcb-image0 libegl1 libxss1
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip "PySide6-Essentials>=6.8" "pyinstaller>=6.10" pillow pyflakes
+
+      - name: Check the code
+        run: python -m pyflakes water_reminder.py packaging/build.py
+
+      - name: Build
+        run: python packaging/build.py
+
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y xvfb
+          export HOME=$(mktemp -d)
+          xvfb-run -a ./dist/release/WaterReminder-Linux-* --status
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WaterReminder-${{ matrix.label }}
+          path: dist/release/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          body: |
+            ## Download
+            | System | File |
+            |---|---|
+            | Windows 10/11 | **WaterReminder-Windows.exe** |
+            | macOS 12+ (Apple Silicon) | **WaterReminder-macOS.dmg** |
+            | Linux (x86-64) | **WaterReminder-Linux-x86_64** |
+
+            Just open the file — it installs itself, starts at login, and says hello.
+            See the README for first-launch tips (Windows SmartScreen / macOS Gatekeeper).
