@@ -1,27 +1,29 @@
 #!/usr/bin/env python3
 """
-Water Reminder - an animated hydration buddy for Linux desktops.
+Water Reminder - an animated hydration buddy for Windows, macOS and Linux.
 
-A cute water-drop mascot swims onto your screen every N minutes, holding a
-glass of water, with a rising wave along the bottom of the screen. Click
-"I drank a glass" to log it, or snooze.
+Every N minutes a cute water-drop mascot swims onto your screen holding a glass
+of water, while a wave rises along the bottom of the screen. Click
+"I drank a glass" to log it, or snooze it.
 
 Usage:
-  water_reminder.py            run the background reminder (normally started at login)
-  water_reminder.py --now      show the reminder right now
-  water_reminder.py --status   print today's progress
-  water_reminder.py --stop     stop the background reminder
+  water_reminder.py              run in the background (normally started at login)
+  water_reminder.py --now        show the reminder right now
+  water_reminder.py --status     print today's progress
+  water_reminder.py --stop       stop the background reminder
+  water_reminder.py --install    set up start-at-login for this user
+  water_reminder.py --uninstall  remove start-at-login (add --purge to delete history)
 
-Config: ~/.config/water-reminder/config.json  (re-read on every reminder)
+Requires Python 3.9+ and PySide6 (pip install PySide6-Essentials).
 """
 import argparse
 import datetime
-import fcntl
+import getpass
 import json
 import math
 import os
-import pwd
 import random
+import re
 import shutil
 import signal
 import struct
@@ -30,30 +32,53 @@ import sys
 import time
 import wave
 
-# Positioning a full-screen transparent overlay needs X11 (or XWayland on Wayland).
-os.environ.setdefault("GDK_BACKEND", "x11,wayland")
+APP_NAME = "Water Reminder"
+APP_ID = "water-reminder"
+IS_WIN = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
+IS_LINUX = not IS_WIN and not IS_MAC
 
-import cairo  # noqa: E402
-import gi  # noqa: E402
-
-gi.require_version("Gtk", "3.0")
-gi.require_version("Gdk", "3.0")
-gi.require_version("Pango", "1.0")
-gi.require_version("PangoCairo", "1.0")
-from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+# On Linux Wayland, use XWayland so the overlay can be positioned and kept on top.
+if IS_LINUX and os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY") \
+        and not os.environ.get("QT_QPA_PLATFORM"):
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 try:
-    gi.require_foreign("cairo")
-except Exception:
-    pass
+    from PySide6.QtCore import QCoreApplication, QElapsedTimer, QPointF, QRectF, Qt, QTimer, QUrl
+    from PySide6.QtGui import (QAction, QColor, QCursor, QDesktopServices, QFont, QFontMetricsF,
+                               QGuiApplication, QIcon, QLinearGradient, QPainter, QPainterPath,
+                               QPen, QPixmap, QPolygonF, QRadialGradient)
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
+    from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
+except ImportError:
+    print("PySide6 is not installed. Run:  python3 -m pip install PySide6-Essentials", file=sys.stderr)
+    sys.exit(1)
 
-APP = "water-reminder"
-CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), APP)
-DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), APP)
+
+# --------------------------------------------------------------------------- #
+# Paths
+# --------------------------------------------------------------------------- #
+def _home(*p):
+    return os.path.join(os.path.expanduser("~"), *p)
+
+
+if IS_WIN:
+    DATA_DIR = os.path.join(os.environ.get("APPDATA") or _home("AppData", "Roaming"), "WaterReminder")
+    CONFIG_DIR = DATA_DIR
+    APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or _home("AppData", "Local"), "WaterReminder", "app")
+elif IS_MAC:
+    DATA_DIR = _home("Library", "Application Support", "WaterReminder")
+    CONFIG_DIR = DATA_DIR
+    APP_DIR = os.path.join(DATA_DIR, "app")
+else:
+    DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME") or _home(".local", "share"), APP_ID)
+    CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or _home(".config"), APP_ID)
+    APP_DIR = os.path.join(DATA_DIR, "app")
+
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
-LOCK_FILE = os.path.join(DATA_DIR, "daemon.lock")
-PID_FILE = os.path.join(DATA_DIR, "daemon.pid")
+LOG_FILE = os.path.join(DATA_DIR, "service.log")
+SERVER_NAME = "water-reminder-" + re.sub(r"\W", "_", getpass.getuser())
 
 DEFAULTS = {
     "interval_minutes": 30,
@@ -77,8 +102,6 @@ TIPS = [
     "Your code compiles better when you're hydrated. Probably.",
 ]
 
-FONT = "Inter, Ubuntu, Cantarell, Noto Sans, DejaVu Sans, Sans"
-
 
 # --------------------------------------------------------------------------- #
 # Config & state
@@ -95,22 +118,22 @@ def _merge(base, extra):
 
 def load_config():
     try:
-        with open(CONFIG_FILE) as f:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
             return _merge(DEFAULTS, json.load(f))
     except FileNotFoundError:
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(CONFIG_FILE, "w") as f:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(DEFAULTS, f, indent=2)
         return dict(DEFAULTS)
-    except Exception as e:  # broken JSON -> fall back to defaults
-        print(f"[{APP}] config error ({e}); using defaults", file=sys.stderr)
+    except Exception as e:
+        print(f"[{APP_ID}] config error ({e}); using defaults", file=sys.stderr)
         return dict(DEFAULTS)
 
 
 def load_state():
     today = datetime.date.today().isoformat()
     try:
-        with open(STATE_FILE) as f:
+        with open(STATE_FILE, encoding="utf-8") as f:
             st = json.load(f)
     except Exception:
         st = {}
@@ -124,11 +147,10 @@ def load_state():
 def save_state(st):
     os.makedirs(DATA_DIR, exist_ok=True)
     st["history"][st["date"]] = st["count"]
-    # keep the last 60 days
     for k in sorted(st["history"])[:-60]:
         del st["history"][k]
     tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(st, f, indent=2)
     os.replace(tmp, STATE_FILE)
 
@@ -143,21 +165,24 @@ def in_quiet_hours(cfg):
     except ValueError:
         return False
     now = datetime.datetime.now().time()
-    if s <= e:
-        return s <= now < e
-    return now >= s or now < e
+    return (s <= now < e) if s <= e else (now >= s or now < e)
 
 
 def user_first_name(cfg):
     if cfg.get("name"):
         return cfg["name"]
+    full = ""
     try:
-        pw = pwd.getpwuid(os.getuid())
-        full = (pw.pw_gecos or "").split(",")[0].strip()
-        name = full.split()[0] if full else pw.pw_name
-        return name[:1].upper() + name[1:]
+        if IS_MAC:
+            full = subprocess.run(["id", "-F"], capture_output=True, text=True, timeout=2).stdout.strip()
+        elif IS_LINUX:
+            import pwd
+            full = (pwd.getpwuid(os.getuid()).pw_gecos or "").split(",")[0].strip()
     except Exception:
-        return "friend"
+        pass
+    name = full.split()[0] if full else getpass.getuser()
+    name = re.split(r"[._@\s]", name)[0] or "friend"
+    return name[:1].upper() + name[1:]
 
 
 # --------------------------------------------------------------------------- #
@@ -172,19 +197,15 @@ def _make_bloop(path, double):
         phase = 0.0
         for i in range(n):
             t = i / n
-            f = f0 * (f1 / f0) ** t
-            phase += 2 * math.pi * f / rate
+            phase += 2 * math.pi * f0 * (f1 / f0) ** t / rate
             env = math.sin(math.pi * min(1, t * 6)) if t < 1 / 12 else (1 - t) ** 2.2
             frames.extend(struct.pack("<h", int(32767 * vol * env * math.sin(phase))))
 
-    def silence(d):
-        frames.extend(b"\x00\x00" * int(rate * d))
-
     bloop(380, 1100, 0.13, 0.45)
     if double:
-        silence(0.07)
+        frames.extend(b"\x00\x00" * int(rate * 0.07))
         bloop(520, 1500, 0.12, 0.40)
-    silence(0.05)
+    frames.extend(b"\x00\x00" * int(rate * 0.05))
     with wave.open(path, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
@@ -198,10 +219,98 @@ def play_sound(kind):
         if not os.path.exists(path):
             os.makedirs(DATA_DIR, exist_ok=True)
             _make_bloop(path, double=(kind == "reminder"))
-        for player in (["paplay"], ["pw-play"], ["aplay", "-q"]):
+        if IS_WIN:
+            import winsound
+            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            return
+        players = [["afplay"]] if IS_MAC else [["paplay"], ["pw-play"], ["aplay", "-q"]]
+        for player in players:
             if shutil.which(player[0]):
                 subprocess.Popen(player + [path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Platform helpers (all best-effort)
+# --------------------------------------------------------------------------- #
+class _X11:
+    """Tiny ctypes bridge to Xlib for click-through input shapes on Linux/X11."""
+    _dpy = None
+    _ok = None
+
+    @classmethod
+    def _init(cls):
+        if cls._ok is not None:
+            return cls._ok
+        cls._ok = False
+        try:
+            import ctypes
+            import ctypes.util
+            cls.ct = ctypes
+            cls.xlib = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+            cls.xext = ctypes.CDLL(ctypes.util.find_library("Xext") or "libXext.so.6")
+            cls.xlib.XOpenDisplay.restype = ctypes.c_void_p
+            cls.xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            cls.xlib.XFlush.argtypes = [ctypes.c_void_p]
+            cls.xlib.XInternAtom.restype = ctypes.c_ulong
+            cls.xlib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+            cls.xlib.XGetSelectionOwner.restype = ctypes.c_ulong
+            cls.xlib.XGetSelectionOwner.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            cls.xlib.XDefaultScreen.argtypes = [ctypes.c_void_p]
+
+            class XRectangle(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_short), ("y", ctypes.c_short),
+                            ("width", ctypes.c_ushort), ("height", ctypes.c_ushort)]
+            cls.XRectangle = XRectangle
+            cls.xext.XShapeCombineRectangles.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(XRectangle), ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            cls._dpy = cls.xlib.XOpenDisplay(None)
+            cls._ok = bool(cls._dpy)
+        except Exception:
+            cls._ok = False
+        return cls._ok
+
+    @classmethod
+    def has_compositor(cls):
+        if not cls._init():
+            return True  # unknown: assume yes
+        scr = cls.xlib.XDefaultScreen(cls._dpy)
+        atom = cls.xlib.XInternAtom(cls._dpy, f"_NET_WM_CM_S{scr}".encode(), 0)
+        return cls.xlib.XGetSelectionOwner(cls._dpy, atom) != 0
+
+    @classmethod
+    def set_input_rects(cls, wid, rects):
+        if not cls._init():
+            return
+        arr = (cls.XRectangle * max(1, len(rects)))()
+        for i, (x, y, w, h) in enumerate(rects):
+            arr[i] = cls.XRectangle(int(x), int(y), max(0, int(w)), max(0, int(h)))
+        # ShapeInput = 2, ShapeSet = 0, Unsorted = 0
+        cls.xext.XShapeCombineRectangles(cls._dpy, int(wid), 2, 0, 0, arr, len(rects), 0, 0)
+        cls.xlib.XFlush(cls._dpy)
+
+
+def is_x11():
+    return IS_LINUX and QGuiApplication.platformName() == "xcb"
+
+
+def mac_hide_dock_icon():
+    """Run as a menu-bar-only app (no Dock icon) on macOS."""
+    try:
+        import ctypes
+        import ctypes.util
+        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.objc_msgSend.restype = ctypes.c_void_p
+        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        ns_app = objc.objc_msgSend(objc.objc_getClass(b"NSApplication"),
+                                   objc.sel_registerName(b"sharedApplication"))
+        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
+        objc.objc_msgSend(ns_app, objc.sel_registerName(b"setActivationPolicy:"), 1)
     except Exception:
         pass
 
@@ -230,93 +339,122 @@ def ease_out_back(t, s=1.9):
     return t * t * ((s + 1) * t + s) + 1
 
 
-def rounded_rect(cr, x, y, w, h, r):
+def C(r, g, b, a=1.0):
+    return QColor.fromRgbF(clamp(r, 0, 1), clamp(g, 0, 1), clamp(b, 0, 1), clamp(a, 0, 1))
+
+
+def _rect(cx, cy, r):
+    return QRectF(cx - r, cy - r, 2 * r, 2 * r)
+
+
+def arc_to(path, cx, cy, r, a1, a2):
+    """Cairo-style arc (radians, clockwise on screen), connected to the current point."""
+    path.arcTo(_rect(cx, cy, r), -math.degrees(a1), -math.degrees(a2 - a1))
+
+
+def arc_path(cx, cy, r, a1, a2):
+    p = QPainterPath()
+    p.arcMoveTo(_rect(cx, cy, r), -math.degrees(a1))
+    p.arcTo(_rect(cx, cy, r), -math.degrees(a1), -math.degrees(a2 - a1))
+    return p
+
+
+def drop_path(R, cx=0.0, cy=0.0):
+    p = QPainterPath()
+    p.moveTo(cx, cy - 1.75 * R)
+    p.cubicTo(cx + 0.3 * R, cy - 1.2 * R, cx + R, cy - 0.75 * R, cx + R, cy)
+    arc_to(p, cx, cy, R, 0, math.pi)
+    p.cubicTo(cx - R, cy - 0.75 * R, cx - 0.3 * R, cy - 1.2 * R, cx, cy - 1.75 * R)
+    p.closeSubpath()
+    return p
+
+
+def rounded(x, y, w, h, r):
+    p = QPainterPath()
     r = min(r, w / 2, h / 2)
-    cr.new_sub_path()
-    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
-    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
-    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
-    cr.arc(x + r, y + r, r, math.pi, 1.5 * math.pi)
-    cr.close_path()
+    p.addRoundedRect(QRectF(x, y, w, h), r, r)
+    return p
 
 
-def drop_path(cr, R):
-    cr.move_to(0, -1.75 * R)
-    cr.curve_to(0.3 * R, -1.2 * R, R, -0.75 * R, R, 0)
-    cr.arc(0, 0, R, 0, math.pi)
-    cr.curve_to(-R, -0.75 * R, -0.3 * R, -1.2 * R, 0, -1.75 * R)
-    cr.close_path()
-
-
-def make_layout(cr, text, px, bold=False, width=None):
-    lay = PangoCairo.create_layout(cr)
-    fd = Pango.FontDescription.from_string(FONT)
-    fd.set_absolute_size(px * Pango.SCALE)
-    if bold:
-        fd.set_weight(Pango.Weight.BOLD)
-    lay.set_font_description(fd)
-    if width:
-        lay.set_width(int(width * Pango.SCALE))
-        lay.set_wrap(Pango.WrapMode.WORD_CHAR)
-    lay.set_text(text, -1)
-    return lay
-
-
-def show_layout(cr, lay, x, y, rgba):
-    cr.move_to(x, y)
-    cr.set_source_rgba(*rgba)
-    PangoCairo.show_layout(cr, lay)
-
-
-def glass_path(cr, x, y, w, h):
-    """Tapered glass, (x, y) = top-left of its bounding box."""
+def glass_path(x, y, w, h):
     inset = w * 0.12
-    cr.move_to(x, y)
-    cr.line_to(x + w, y)
-    cr.line_to(x + w - inset, y + h)
-    cr.line_to(x + inset, y + h)
-    cr.close_path()
+    p = QPainterPath()
+    p.addPolygon(QPolygonF([QPointF(x, y), QPointF(x + w, y), QPointF(x + w - inset, y + h),
+                            QPointF(x + inset, y + h)]))
+    p.closeSubpath()
+    return p
 
 
-def draw_glass(cr, x, y, w, h, level, t, tilt=0.0):
-    """Glass with sloshing water. level in 0..1."""
-    cr.save()
-    glass_path(cr, x, y, w, h)
-    cr.set_source_rgba(1, 1, 1, 0.30)
-    cr.fill_preserve()
-    cr.clip()
+def fill(p, path, brush):
+    p.setPen(Qt.NoPen)
+    p.setBrush(brush)
+    p.drawPath(path)
+
+
+def stroke(p, path, color, width):
+    p.setPen(QPen(color, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    p.setBrush(Qt.NoBrush)
+    p.drawPath(path)
+
+
+def ellipse(p, cx, cy, rx, ry, brush):
+    p.setPen(Qt.NoPen)
+    p.setBrush(brush)
+    p.drawEllipse(QPointF(cx, cy), rx, ry)
+
+
+def lin(x0, y0, x1, y1, stops):
+    g = QLinearGradient(x0, y0, x1, y1)
+    for pos, col in stops:
+        g.setColorAt(pos, col)
+    return g
+
+
+def rad(cx, cy, r, stops):
+    g = QRadialGradient(cx, cy, r)
+    for pos, col in stops:
+        g.setColorAt(pos, col)
+    return g
+
+
+def make_font(px, bold=False):
+    f = QFont(QGuiApplication.font())
+    f.setPixelSize(max(1, int(round(px))))
+    f.setBold(bold)
+    return f
+
+
+def text_height(font, text, width):
+    fm = QFontMetricsF(font)
+    return fm.boundingRect(QRectF(0, 0, width, 100000), int(Qt.TextWordWrap), text).height()
+
+
+def draw_glass(p, x, y, w, h, level, t, tilt=0.0):
+    gp = glass_path(x, y, w, h)
+    fill(p, gp, C(1, 1, 1, 0.30))
     if level > 0.01:
+        p.save()
+        p.setClipPath(gp)
         top = y + h * (1 - level * 0.88)
-        cr.move_to(x - 2, y + h + 2)
+        wp = QPainterPath()
+        wp.moveTo(x - 2, y + h + 2)
         steps = 12
         for i in range(steps + 1):
             px = x - 2 + (w + 4) * i / steps
-            wy = top + math.sin(t * 5 + i * 0.9) * h * 0.035 + (i / steps - 0.5) * tilt * h * 0.5
-            cr.line_to(px, wy)
-        cr.line_to(x + w + 2, y + h + 2)
-        cr.close_path()
-        g = cairo.LinearGradient(0, top, 0, y + h)
-        g.add_color_stop_rgba(0, 0.55, 0.88, 1.0, 0.95)
-        g.add_color_stop_rgba(1, 0.12, 0.50, 0.95, 0.95)
-        cr.set_source(g)
-        cr.fill()
-    cr.restore()
-    glass_path(cr, x, y, w, h)
-    cr.set_line_width(max(1.5, w * 0.07))
-    cr.set_line_join(cairo.LINE_JOIN_ROUND)
-    cr.set_source_rgba(1, 1, 1, 0.95)
-    cr.stroke()
-    # shine
-    cr.move_to(x + w * 0.22, y + h * 0.15)
-    cr.line_to(x + w * 0.28, y + h * 0.75)
-    cr.set_line_width(max(1.2, w * 0.06))
-    cr.set_line_cap(cairo.LINE_CAP_ROUND)
-    cr.set_source_rgba(1, 1, 1, 0.75)
-    cr.stroke()
+            wp.lineTo(px, top + math.sin(t * 5 + i * 0.9) * h * 0.035 + (i / steps - 0.5) * tilt * h * 0.5)
+        wp.lineTo(x + w + 2, y + h + 2)
+        wp.closeSubpath()
+        fill(p, wp, lin(0, top, 0, y + h, [(0, C(0.55, 0.88, 1.0, 0.95)), (1, C(0.12, 0.50, 0.95, 0.95))]))
+        p.restore()
+    stroke(p, gp, C(1, 1, 1, 0.95), max(1.5, w * 0.07))
+    shine = QPainterPath()
+    shine.moveTo(x + w * 0.22, y + h * 0.15)
+    shine.lineTo(x + w * 0.28, y + h * 0.75)
+    stroke(p, shine, C(1, 1, 1, 0.75), max(1.2, w * 0.06))
 
 
 # --------------------------------------------------------------------------- #
-# Scene: all animation logic, independent of the window
+# Scene: animation state + drawing, in "screen" coordinates
 # --------------------------------------------------------------------------- #
 class Particle:
     __slots__ = ("kind", "x", "y", "vx", "vy", "r", "life", "max_life", "spin", "seed")
@@ -334,7 +472,6 @@ class Scene:
     CELEBRATE_DUR = 2.6
 
     def __init__(self, W, H, cfg, count, name, compact=False):
-        self.W, self.H = W, H
         self.cfg = cfg
         self.compact = compact
         self.count = count
@@ -345,11 +482,21 @@ class Scene:
         self.name = name
         self.tip = random.choice(TIPS)
 
-        self.u = clamp(H / 1080, 0.85, 1.3) if not compact else 0.9
-        self.R = 52 * self.u
-        self.bw = 372 * self.u
-        self.bh_est = 236 * self.u
-        self.wave_h = 0 if compact else 70 * self.u
+        u = self.u = 0.9 if compact else clamp(H / 1080, 0.85, 1.3)
+        self.R = 52 * u
+        self.bw = 372 * u
+        self.pad = 20 * u
+        self.gap = 24 * u
+        self.bh_max = max(self.bubble_height(False), self.bubble_height(True))
+        self.margin = 60 * u
+        self.wave_h = 0 if compact else 70 * u
+        self.fx_h = int(self.wave_h + 80 * u)
+
+        # Layout of the (moving) mascot window, relative to the drop's centre
+        self.win_w = int(self.bw + 2 * self.margin)
+        self.anchor_y = self.margin + self.bh_max + self.gap + 1.75 * self.R + 0.95 * self.R
+        self.win_h = int(self.anchor_y + self.R + 40 * u + self.margin)
+        self.W, self.H = (self.win_w, self.win_h) if compact else (W, H)
 
         self.t = 0.0
         self.state = "enter"
@@ -361,9 +508,8 @@ class Scene:
 
         self._setup_roam()
         sx, sy = self.roam_pos(0)
-        self.start = (-self.R * 4, sy + 40 * self.u) if not compact else (sx, H + self.R * 3)
+        self.start = (sx, self.H + self.R * 3) if compact else (-self.R * 4, sy + 40 * u)
         self.pos = self.start
-        self.prev = self.start
         self.vel = (0.0, 0.0)
         self.exit_from = self.exit_to = self.start
 
@@ -379,17 +525,41 @@ class Scene:
         self.face = "normal"
         self.buttons = {}
         self.bubble_rect = None
-        self.bubble_bob = 0.0
         self._wave_spawn = 0.0
         self._trail_spawn = 0.0
 
-    # -- motion ------------------------------------------------------------ #
+    # -- text ---------------------------------------------------------------- #
+    def _texts(self, celebrate, count=None):
+        count = self.count if count is None else count
+        if celebrate:
+            if count < self.goal:
+                return f"Great job, {self.name}!", f"+{self.ml} ml logged. Your body says thank you."
+            return "Daily goal reached!", "You're a hydration hero today. Keep sipping!"
+        return f"Time to drink water, {self.name}!", self.tip
+
+    def bubble_height(self, celebrate):
+        u, pad = self.u, self.pad
+        inner = self.bw - 2 * pad
+        best = 0
+        for c in (self.count + 1, self.goal + 1):
+            title, sub = self._texts(celebrate, c)
+            th = text_height(make_font(19 * u, True), title, inner - 58 * u)
+            sh = text_height(make_font(13.5 * u), sub, inner)
+            best = max(best, self._bh(th, sh, celebrate))
+        return best
+
+    def _bh(self, th, sh, celebrate):
+        u = self.u
+        btn = 0 if celebrate else 14 * u + 42 * u
+        return self.pad + max(th, 26 * u) + 6 * u + sh + 14 * u + 24 * u + btn + self.pad
+
+    # -- motion -------------------------------------------------------------- #
     def _setup_roam(self):
         u, R = self.u, self.R
         xmin, xmax = self.bw / 2 + 24 * u, self.W - self.bw / 2 - 24 * u
         if xmin > xmax:
             xmin = xmax = self.W / 2
-        ymin = 1.75 * R + 26 * u + self.bh_est + 16 * u
+        ymin = 1.75 * R + 0.95 * R + self.gap + self.bh_max + 16 * u
         ymax = self.H - R - self.wave_h - 34 * u
         if ymin > ymax:
             ymin = ymax
@@ -399,6 +569,13 @@ class Scene:
     def roam_pos(self, rt):
         return (self.cx + self.ax * math.sin(0.16 * rt - 0.9),
                 self.cy + self.ay * math.sin(0.27 * rt + 0.7))
+
+    def origin(self):
+        """Top-left of the mascot window, in scene coordinates."""
+        if self.compact:
+            return 0.0, 0.0
+        x, y = self.pos
+        return x - self.win_w / 2, y - self.anchor_y
 
     def leave(self, result):
         if self.state in ("exit", "celebrate"):
@@ -417,14 +594,15 @@ class Scene:
         self.state, self.state_t = "exit", 0.0
         x, y = self.pos
         self.exit_from = (x, y)
+        u = self.u
         if self.compact:
             self.exit_to = (x, self.H + self.R * 4)
         elif self.result == "snooze":
-            self.exit_to = (-self.R * 5, y + 60 * self.u)
+            self.exit_to = (-self.win_w, y + 60 * u)
         elif self.result == "drank":
-            self.exit_to = (self.W + self.R * 5, y - 160 * self.u)
+            self.exit_to = (self.W + self.win_w, y - 160 * u)
         else:
-            self.exit_to = (self.W + self.R * 5, y + 40 * self.u)
+            self.exit_to = (self.W + self.win_w, y + 40 * u)
 
     def poke(self):
         if self.jump_t < 0 and self.state == "idle":
@@ -433,23 +611,23 @@ class Scene:
 
     def _splash(self, n, power=1.0):
         x, y = self.pos
+        u = self.u
         for _ in range(n):
-            a = random.uniform(-math.pi * 0.95, -math.pi * 0.05)
-            sp = random.uniform(260, 620) * self.u * power
+            a = random.uniform(-math.pi * 0.92, -math.pi * 0.08)
+            sp = random.uniform(220, 470) * u * power
             self.particles.append(Particle("drop", x, y - self.R * 0.6, math.cos(a) * sp,
-                                           math.sin(a) * sp, random.uniform(4, 8) * self.u,
-                                           random.uniform(0.9, 1.5)))
+                                           math.sin(a) * sp, random.uniform(4, 8) * u,
+                                           random.uniform(0.8, 1.2)))
         for _ in range(int(n * 0.4)):
             a = random.uniform(0, 2 * math.pi)
-            sp = random.uniform(80, 260) * self.u * power
+            sp = random.uniform(70, 200) * u * power
             self.particles.append(Particle("spark", x, y - self.R * 0.6, math.cos(a) * sp,
-                                           math.sin(a) * sp - 120 * self.u, random.uniform(5, 10) * self.u,
-                                           random.uniform(0.8, 1.4)))
+                                           math.sin(a) * sp - 100 * u, random.uniform(5, 10) * u,
+                                           random.uniform(0.8, 1.3)))
 
     def body_offset(self):
-        """Vertical offset from bobbing / jumping."""
-        u, R = self.u, self.R
-        off = math.sin(self.t * 2.4) * 5 * u
+        R = self.R
+        off = math.sin(self.t * 2.4) * 5 * self.u
         if self.jump_t >= 0:
             off -= math.sin(clamp(self.jump_t / 0.55, 0, 1) * math.pi) * R * 0.9
         if self.state == "celebrate":
@@ -488,10 +666,10 @@ class Scene:
             e = ease_in_cubic(k)
             x = lerp(self.exit_from[0], self.exit_to[0], e)
             y = lerp(self.exit_from[1], self.exit_to[1], e) + math.sin(k * math.pi * 2) * 20 * u
-            if k >= 1 and not self.particles_alive():
-                self.done = True
             if k >= 1:
                 x, y = self.exit_to
+                if self.wave_level < 0.02 or self.compact:
+                    self.done = True
 
         if dt > 0:
             vx, vy = (x - self.pos[0]) / dt, (y - self.pos[1]) / dt
@@ -503,7 +681,6 @@ class Scene:
             if self.jump_t > 0.55:
                 self.jump_t = -1.0
 
-        # blinking
         self.blink_next -= dt
         if self.blink_next <= 0:
             self.blink_t = 0.0
@@ -513,45 +690,37 @@ class Scene:
             if self.blink_t > 0.16:
                 self.blink_t = -1.0
 
-        # wave + bubble visibility
-        wave_target = 0.0 if self.state == "exit" else 1.0
-        self.wave_level += (wave_target - self.wave_level) * min(1.0, dt * 1.6)
-        show_bubble = self.state in ("idle", "celebrate")
-        if show_bubble:
+        target = 0.0 if self.state == "exit" else 1.0
+        self.wave_level += (target - self.wave_level) * min(1.0, dt * (3.0 if target == 0 else 1.6))
+        if self.state in ("idle", "celebrate"):
             self.bubble_vis = min(1.0, self.bubble_vis + dt / 0.5)
         else:
             self.bubble_vis = max(0.0, self.bubble_vis - dt / 0.22)
 
         self._update_particles(dt)
 
-    def particles_alive(self):
-        return any(p.kind in ("drop", "spark") for p in self.particles)
-
     def _update_particles(self, dt):
         u = self.u
-        # bubbles rising out of the wave
-        if self.wave_h and self.wave_level > 0.3:
+        if self.wave_h and self.wave_level > 0.3 and self.state != "exit":
             self._wave_spawn += dt * 7 * self.wave_level
             while self._wave_spawn > 1:
                 self._wave_spawn -= 1
-                x = random.uniform(0, self.W)
-                self.particles.append(Particle("bubble", x, self.H - random.uniform(5, 40) * u,
-                                               0, -random.uniform(25, 60) * u,
-                                               random.uniform(3, 9) * u, random.uniform(1.2, 2.6)))
-        # trail bubbles behind the moving drop
+                self.particles.append(Particle("bubble", random.uniform(0, self.W),
+                                               self.H - random.uniform(5, 40) * u, 0,
+                                               -random.uniform(25, 55) * u, random.uniform(3, 9) * u,
+                                               random.uniform(1.2, 2.4)))
         sp = math.hypot(*self.vel)
-        if sp > 30 * u:
+        if sp > 30 * u and not self.compact:
             self._trail_spawn += dt * min(18, sp / (14 * u))
             while self._trail_spawn > 1:
                 self._trail_spawn -= 1
                 x, y = self.pos
                 nx, ny = -self.vel[0] / sp, -self.vel[1] / sp
                 self.particles.append(Particle(
-                    "bubble", x + nx * self.R * 1.1 + random.uniform(-8, 8) * u,
+                    "trail", x + nx * self.R * 1.1 + random.uniform(-8, 8) * u,
                     y + ny * self.R * 0.6 + random.uniform(-10, 10) * u,
                     nx * 20 * u, -random.uniform(20, 50) * u, random.uniform(3, 8) * u,
-                    random.uniform(0.8, 1.6)))
-
+                    random.uniform(0.6, 1.2)))
         alive = []
         g = 1100 * u
         for p in self.particles:
@@ -577,7 +746,7 @@ class Scene:
                 return True
         return False
 
-    # -- hit testing ------------------------------------------------------- #
+    # -- hit testing ---------------------------------------------------------- #
     def drop_rect(self, pad=0.0):
         x, y = self.pos
         R = self.R
@@ -605,98 +774,91 @@ class Scene:
             return "drop"
         return None
 
-    # -- drawing ----------------------------------------------------------- #
-    def draw(self, cr):
-        if self.compact:
-            g = cairo.LinearGradient(0, 0, 0, self.H)
-            g.add_color_stop_rgb(0, 0.93, 0.97, 1.0)
-            g.add_color_stop_rgb(1, 0.78, 0.89, 0.99)
-            cr.set_source(g)
-            cr.paint()
-        self._draw_wave(cr)
-        self._draw_particles(cr, ("bubble",))
-        self._draw_drop(cr)
-        self._draw_bubble(cr)
-        self._draw_particles(cr, ("drop", "spark"))
+    # -- drawing -------------------------------------------------------------- #
+    def draw_fx(self, p):
+        """Wave + rising bubbles (bottom strip of the screen)."""
+        self._draw_wave(p)
+        fx_rect = (0, self.H - self.fx_h, self.W, self.fx_h)
+        self._draw_particles(p, ("bubble",), fx_rect)
 
-    def _draw_wave(self, cr):
+    def draw_mascot(self, p, clip_rect=None):
+        if self.compact:
+            p.fillRect(QRectF(0, 0, self.W, self.H),
+                       lin(0, 0, 0, self.H, [(0, C(0.93, 0.97, 1.0)), (1, C(0.78, 0.89, 0.99))]))
+        self._draw_particles(p, ("trail",), clip_rect)
+        self._draw_drop(p)
+        self._draw_bubble(p)
+        self._draw_particles(p, ("drop", "spark"), clip_rect)
+
+    def _draw_wave(self, p):
         if not self.wave_h or self.wave_level < 0.01:
             return
         W, H, t, u = self.W, self.H, self.t, self.u
         base = self.wave_h * ease_out_cubic(clamp(self.wave_level, 0, 1))
-        layers = [
-            (12 * u, 0.0060, 0.9, 18 * u, 0.30),
-            (9 * u, 0.0085, -1.3, 0.0, 0.42),
-        ]
-        for amp, freq, spd, lift, alpha in layers:
+        for amp, freq, spd, lift, alpha in ((12 * u, 0.0060, 0.9, 18 * u, 0.30),
+                                            (9 * u, 0.0085, -1.3, 0.0, 0.42)):
             pts = []
             for x in range(-20, int(W) + 40, 16):
-                y = (H - base - lift + amp * math.sin(x * freq + t * spd)
-                     + amp * 0.45 * math.sin(x * freq * 2.3 - t * spd * 1.6))
-                pts.append((x, y))
-            cr.move_to(-20, H + 2)
-            for p in pts:
-                cr.line_to(*p)
-            cr.line_to(W + 40, H + 2)
-            cr.close_path()
-            g = cairo.LinearGradient(0, H - base - lift - amp, 0, H)
-            g.add_color_stop_rgba(0, 0.50, 0.85, 1.0, alpha)
-            g.add_color_stop_rgba(1, 0.08, 0.40, 0.88, alpha + 0.2)
-            cr.set_source(g)
-            cr.fill()
-            # foam line
-            cr.move_to(*pts[0])
-            for p in pts[1:]:
-                cr.line_to(*p)
-            cr.set_line_width(2 * u)
-            cr.set_source_rgba(1, 1, 1, alpha * 1.3)
-            cr.stroke()
+                pts.append(QPointF(x, H - base - lift + amp * math.sin(x * freq + t * spd)
+                                   + amp * 0.45 * math.sin(x * freq * 2.3 - t * spd * 1.6)))
+            body = QPainterPath()
+            body.moveTo(-20, H + 2)
+            for pt in pts:
+                body.lineTo(pt)
+            body.lineTo(W + 40, H + 2)
+            body.closeSubpath()
+            fill(p, body, lin(0, H - base - lift - amp, 0, H,
+                              [(0, C(0.50, 0.85, 1.0, alpha)), (1, C(0.08, 0.40, 0.88, alpha + 0.2))]))
+            foam = QPainterPath(pts[0])
+            for pt in pts[1:]:
+                foam.lineTo(pt)
+            stroke(p, foam, C(1, 1, 1, alpha * 1.3), 2 * u)
 
-    def _draw_particles(self, cr, kinds):
-        for p in self.particles:
-            if p.kind not in kinds:
+    def _draw_particles(self, p, kinds, clip_rect=None):
+        u = self.u
+        edge = 40 * u
+        for q in self.particles:
+            if q.kind not in kinds:
                 continue
-            a = clamp(p.life / p.max_life, 0, 1)
-            if p.kind == "bubble":
-                fade = min(1.0, a * 3) * min(1.0, (p.max_life - p.life) * 4)
-                cr.arc(p.x, p.y, p.r, 0, 2 * math.pi)
-                cr.set_source_rgba(0.75, 0.92, 1, 0.18 * fade)
-                cr.fill_preserve()
-                cr.set_line_width(1.4 * self.u)
-                cr.set_source_rgba(1, 1, 1, 0.75 * fade)
-                cr.stroke()
-                cr.arc(p.x - p.r * 0.35, p.y - p.r * 0.35, p.r * 0.25, 0, 2 * math.pi)
-                cr.set_source_rgba(1, 1, 1, 0.9 * fade)
-                cr.fill()
-            elif p.kind == "drop":
-                cr.save()
-                cr.translate(p.x, p.y)
-                cr.rotate(math.atan2(p.vy, p.vx) + math.pi / 2)
-                s = p.r / 10
-                cr.scale(s, s)
-                drop_path(cr, 6)
-                g = cairo.LinearGradient(-6, -10, 6, 6)
-                g.add_color_stop_rgba(0, 0.65, 0.92, 1, a)
-                g.add_color_stop_rgba(1, 0.12, 0.48, 0.95, a)
-                cr.set_source(g)
-                cr.fill()
-                cr.restore()
-            else:  # spark (4-point star)
-                cr.save()
-                cr.translate(p.x, p.y)
-                cr.rotate(self.t * p.spin * 0.3)
-                r = p.r * (0.6 + 0.4 * math.sin(self.t * 12 + p.seed))
-                cr.move_to(0, -r)
-                for i in range(1, 8):
+            a = clamp(q.life / q.max_life, 0, 1)
+            if clip_rect:
+                cx, cy, cw, ch = clip_rect
+                d = min(q.x - cx, cx + cw - q.x, q.y - cy, cy + ch - q.y)
+                if d <= 0:
+                    continue
+                a *= clamp(d / edge, 0, 1)
+            if q.kind in ("bubble", "trail"):
+                fade = min(1.0, a * 3) * min(1.0, (q.max_life - q.life) * 4)
+                ellipse(p, q.x, q.y, q.r, q.r, C(0.75, 0.92, 1, 0.18 * fade))
+                p.setPen(QPen(C(1, 1, 1, 0.75 * fade), 1.4 * u))
+                p.setBrush(Qt.NoBrush)
+                p.drawEllipse(QPointF(q.x, q.y), q.r, q.r)
+                ellipse(p, q.x - q.r * 0.35, q.y - q.r * 0.35, q.r * 0.25, q.r * 0.25, C(1, 1, 1, 0.9 * fade))
+            elif q.kind == "drop":
+                p.save()
+                p.translate(q.x, q.y)
+                p.rotate(math.degrees(math.atan2(q.vy, q.vx) + math.pi / 2))
+                s = q.r / 10
+                p.scale(s, s)
+                fill(p, drop_path(6), lin(-6, -10, 6, 6, [(0, C(0.65, 0.92, 1, a)), (1, C(0.12, 0.48, 0.95, a))]))
+                p.restore()
+            else:  # spark
+                p.save()
+                p.translate(q.x, q.y)
+                p.rotate(math.degrees(self.t * q.spin * 0.3))
+                r = q.r * (0.6 + 0.4 * math.sin(self.t * 12 + q.seed))
+                pts = []
+                for i in range(8):
                     rr = r if i % 2 == 0 else r * 0.32
                     ang = -math.pi / 2 + i * math.pi / 4
-                    cr.line_to(math.cos(ang) * rr, math.sin(ang) * rr)
-                cr.close_path()
-                cr.set_source_rgba(1.0, 0.86, 0.35, a) if int(p.seed) % 2 else cr.set_source_rgba(1, 1, 1, a)
-                cr.fill()
-                cr.restore()
+                    pts.append(QPointF(math.cos(ang) * rr, math.sin(ang) * rr))
+                star = QPainterPath()
+                star.addPolygon(QPolygonF(pts))
+                star.closeSubpath()
+                fill(p, star, C(1.0, 0.86, 0.35, a) if int(q.seed) % 2 else C(1, 1, 1, a))
+                p.restore()
 
-    def _draw_drop(self, cr):
+    def _draw_drop(self, p):
         R, u, t = self.R, self.u, self.t
         x, y = self.pos
         oy = self.body_offset()
@@ -706,153 +868,96 @@ class Scene:
         if self.jump_t >= 0:
             squash += 0.12 * math.cos(clamp(self.jump_t / 0.55, 0, 1) * math.pi * 2)
 
-        # soft shadow / glow under the drop
-        if not self.compact:
-            cr.save()
-            cr.translate(x, y + R * 1.35)
-            cr.scale(1, 0.28)
-            sh = cairo.RadialGradient(0, 0, 0, 0, 0, R * 1.1)
+        if not self.compact:  # soft shadow
             k = clamp(1 + oy / (R * 2), 0.3, 1)
-            sh.add_color_stop_rgba(0, 0.05, 0.25, 0.55, 0.22 * k)
-            sh.add_color_stop_rgba(1, 0.05, 0.25, 0.55, 0)
-            cr.set_source(sh)
-            cr.arc(0, 0, R * 1.1, 0, 2 * math.pi)
-            cr.fill()
-            cr.restore()
+            p.save()
+            p.translate(x, y + R * 1.35)
+            p.scale(1, 0.28)
+            ellipse(p, 0, 0, R * 1.1, R * 1.1, rad(0, 0, R * 1.1, [(0, C(0.05, 0.25, 0.55, 0.22 * k)),
+                                                                     (1, C(0.05, 0.25, 0.55, 0))]))
+            p.restore()
 
-        cr.save()
-        cr.translate(x, y + oy)
-        cr.rotate(tilt)
-        cr.translate(0, R)  # squash from the bottom
-        cr.scale(1 + squash * 0.7, 1 - squash)
-        cr.translate(0, -R)
+        p.save()
+        p.translate(x, y + oy)
+        p.rotate(math.degrees(tilt))
+        p.translate(0, R)
+        p.scale(1 + squash * 0.7, 1 - squash)
+        p.translate(0, -R)
 
-        # glow
-        gl = cairo.RadialGradient(0, -0.3 * R, R * 0.6, 0, -0.3 * R, R * 2.2)
-        gl.add_color_stop_rgba(0, 0.45, 0.80, 1.0, 0.30)
-        gl.add_color_stop_rgba(1, 0.45, 0.80, 1.0, 0.0)
-        cr.set_source(gl)
-        cr.arc(0, -0.3 * R, R * 2.2, 0, 2 * math.pi)
-        cr.fill()
+        ellipse(p, 0, -0.3 * R, R * 2.2, R * 2.2,
+                rad(0, -0.3 * R, R * 2.2, [(0, C(0.45, 0.80, 1.0, 0.30)), (0.27, C(0.45, 0.80, 1.0, 0.30)),
+                                           (1, C(0.45, 0.80, 1.0, 0.0))]))
+        body = drop_path(R)
+        fill(p, body, lin(-R, -1.75 * R, R, R, [(0, C(0.66, 0.92, 1.0)), (0.5, C(0.26, 0.66, 0.98)),
+                                                (1, C(0.07, 0.37, 0.84))]))
+        fill(p, body, rad(0.35 * R, 0.55 * R, R * 1.1, [(0, C(0.02, 0.18, 0.55, 0.35)),
+                                                          (1, C(0.02, 0.18, 0.55, 0.0))]))
+        stroke(p, body, C(0.04, 0.28, 0.70, 0.45), 2 * u)
 
-        # body
-        drop_path(cr, R)
-        g = cairo.LinearGradient(-R, -1.75 * R, R, R)
-        g.add_color_stop_rgb(0.0, 0.66, 0.92, 1.0)
-        g.add_color_stop_rgb(0.5, 0.26, 0.66, 0.98)
-        g.add_color_stop_rgb(1.0, 0.07, 0.37, 0.84)
-        cr.set_source(g)
-        cr.fill_preserve()
-        shade = cairo.RadialGradient(0.35 * R, 0.55 * R, 0, 0.35 * R, 0.55 * R, R * 1.1)
-        shade.add_color_stop_rgba(0, 0.02, 0.18, 0.55, 0.35)
-        shade.add_color_stop_rgba(1, 0.02, 0.18, 0.55, 0.0)
-        cr.set_source(shade)
-        cr.fill_preserve()
-        cr.set_line_width(2 * u)
-        cr.set_source_rgba(0.04, 0.28, 0.70, 0.45)
-        cr.stroke()
+        p.save()
+        p.translate(-0.45 * R, -0.35 * R)
+        p.rotate(math.degrees(0.35))
+        ellipse(p, 0, 0, 0.17 * R, 0.40 * R, C(1, 1, 1, 0.55))
+        p.restore()
+        ellipse(p, -0.22 * R, -1.0 * R, 0.08 * R, 0.08 * R, C(1, 1, 1, 0.75))
 
-        # highlights
-        cr.save()
-        cr.translate(-0.45 * R, -0.35 * R)
-        cr.rotate(0.35)
-        cr.scale(0.17 * R, 0.40 * R)
-        cr.arc(0, 0, 1, 0, 2 * math.pi)
-        cr.restore()
-        cr.set_source_rgba(1, 1, 1, 0.55)
-        cr.fill()
-        cr.arc(-0.22 * R, -1.0 * R, 0.08 * R, 0, 2 * math.pi)
-        cr.set_source_rgba(1, 1, 1, 0.75)
-        cr.fill()
+        self._draw_face(p)
+        self._draw_arms(p)
+        p.restore()
 
-        self._draw_face(cr)
-        self._draw_arms(cr, back=True)
-        self._draw_arms(cr, back=False)
-        cr.restore()
-
-    def _draw_arms(self, cr, back):
+    def _draw_arms(self, p):
         R, t, u = self.R, self.t, self.u
-        cr.set_line_cap(cairo.LINE_CAP_ROUND)
-        cr.set_line_width(0.17 * R)
-        cr.set_source_rgb(0.16, 0.52, 0.93)
-        if back:
-            # left arm waving hello (or cheering)
-            if self.state == "celebrate":
-                ang = -2.1 + math.sin(t * 14) * 0.4
-            elif self.state in ("enter", "idle"):
-                ang = -2.5 + math.sin(t * 6) * 0.5
-            else:
-                ang = 2.6
-            sx, sy = -0.8 * R, 0.2 * R
-            ex, ey = sx + math.cos(ang) * 0.6 * R, sy + math.sin(ang) * 0.6 * R
-            cr.move_to(sx, sy)
-            cr.line_to(ex, ey)
-            cr.stroke()
-            cr.arc(ex, ey, 0.13 * R, 0, 2 * math.pi)
-            cr.fill()
-            return
+        arm = C(0.16, 0.52, 0.93)
+        pen = QPen(arm, 0.17 * R, Qt.SolidLine, Qt.RoundCap)
+        # left arm: waving hello / cheering
+        if self.state == "celebrate":
+            ang = -2.1 + math.sin(t * 14) * 0.4
+        elif self.state in ("enter", "idle"):
+            ang = -2.5 + math.sin(t * 6) * 0.5
+        else:
+            ang = 2.6
+        sx, sy = -0.8 * R, 0.2 * R
+        ex, ey = sx + math.cos(ang) * 0.6 * R, sy + math.sin(ang) * 0.6 * R
+        p.setPen(pen)
+        p.drawLine(QPointF(sx, sy), QPointF(ex, ey))
+        ellipse(p, ex, ey, 0.13 * R, 0.13 * R, arm)
         # right arm holding the glass
         gw, gh = 0.62 * R, 0.82 * R
         gx = 1.05 * R
-        lift = 0.0
-        if self.state == "celebrate":
-            lift = -0.45 * R * min(1, self.state_t * 3)  # raise glass to "drink"
+        lift = -0.45 * R * min(1, self.state_t * 3) if self.state == "celebrate" else 0.0
         gy = -0.3 * R + lift + math.sin(t * 2.4 + 1) * 2 * u
-        cr.move_to(0.88 * R, 0.15 * R)
-        cr.line_to(gx + 0.05 * R, gy + gh * 0.6)
-        cr.stroke()
-        draw_glass(cr, gx, gy, gw, gh, self.glass_level, t, tilt=math.sin(t * 2.4) * 0.3)
-        cr.set_source_rgb(0.16, 0.52, 0.93)
-        cr.arc(gx + 0.05 * R, gy + gh * 0.6, 0.13 * R, 0, 2 * math.pi)
-        cr.fill()
+        p.setPen(pen)
+        p.drawLine(QPointF(0.88 * R, 0.15 * R), QPointF(gx + 0.05 * R, gy + gh * 0.6))
+        draw_glass(p, gx, gy, gw, gh, self.glass_level, t, tilt=math.sin(t * 2.4) * 0.3)
+        ellipse(p, gx + 0.05 * R, gy + gh * 0.6, 0.13 * R, 0.13 * R, arm)
 
-    def _draw_face(self, cr):
+    def _draw_face(self, p):
         R = self.R
-        dark = (0.06, 0.12, 0.28)
+        dark = C(0.06, 0.12, 0.28)
         ex, ey = 0.36 * R, -0.05 * R
-        cr.set_line_cap(cairo.LINE_CAP_ROUND)
-
-        # cheeks
         for sx in (-1, 1):
-            cr.save()
-            cr.translate(sx * 0.62 * R, 0.24 * R)
-            cr.scale(0.15 * R, 0.085 * R)
-            cr.arc(0, 0, 1, 0, 2 * math.pi)
-            cr.restore()
-            cr.set_source_rgba(1.0, 0.45, 0.62, 0.55)
-            cr.fill()
+            ellipse(p, sx * 0.62 * R, 0.24 * R, 0.15 * R, 0.085 * R, C(1.0, 0.45, 0.62, 0.55))
 
         if self.face == "happy":
-            cr.set_line_width(0.075 * R)
-            cr.set_source_rgb(*dark)
             for sx in (-1, 1):
-                cr.arc(sx * ex, ey + 0.06 * R, 0.14 * R, math.pi * 1.1, math.pi * 1.9)
-                cr.stroke()
-            # open smile
-            cr.move_to(-0.24 * R, 0.2 * R)
-            cr.curve_to(-0.2 * R, 0.55 * R, 0.2 * R, 0.55 * R, 0.24 * R, 0.2 * R)
-            cr.close_path()
-            cr.set_source_rgb(*dark)
-            cr.fill_preserve()
-            cr.save()
-            cr.clip()
-            cr.arc(0, 0.5 * R, 0.16 * R, 0, 2 * math.pi)
-            cr.set_source_rgb(1.0, 0.48, 0.58)
-            cr.fill()
-            cr.restore()
+                stroke(p, arc_path(sx * ex, ey + 0.06 * R, 0.14 * R, math.pi * 1.1, math.pi * 1.9), dark, 0.075 * R)
+            mouth = QPainterPath()
+            mouth.moveTo(-0.24 * R, 0.2 * R)
+            mouth.cubicTo(-0.2 * R, 0.55 * R, 0.2 * R, 0.55 * R, 0.24 * R, 0.2 * R)
+            mouth.closeSubpath()
+            fill(p, mouth, dark)
+            p.save()
+            p.setClipPath(mouth, Qt.IntersectClip)
+            ellipse(p, 0, 0.5 * R, 0.16 * R, 0.16 * R, C(1.0, 0.48, 0.58))
+            p.restore()
             return
 
         if self.face == "sleepy":
-            cr.set_line_width(0.07 * R)
-            cr.set_source_rgb(*dark)
             for sx in (-1, 1):
-                cr.arc(sx * ex, ey - 0.02 * R, 0.13 * R, math.pi * 0.15, math.pi * 0.85)
-                cr.stroke()
-            cr.arc(0, 0.3 * R, 0.06 * R, 0, 2 * math.pi)
-            cr.fill()
+                stroke(p, arc_path(sx * ex, ey - 0.02 * R, 0.13 * R, math.pi * 0.15, math.pi * 0.85), dark, 0.07 * R)
+            ellipse(p, 0, 0.3 * R, 0.06 * R, 0.06 * R, dark)
             return
 
-        # normal eyes that follow the mouse pointer
         blink = 1.0
         if self.blink_t >= 0:
             blink = max(0.08, abs(math.cos(self.blink_t / 0.16 * math.pi)))
@@ -866,331 +971,306 @@ class Scene:
         else:
             lookx = math.sin(self.t * 0.7) * 0.6
         for sx in (-1, 1):
-            cr.save()
-            cr.translate(sx * ex, ey)
-            cr.scale(1, blink)
-            cr.save()
-            cr.scale(0.2 * R, 0.25 * R)
-            cr.arc(0, 0, 1, 0, 2 * math.pi)
-            cr.restore()
-            cr.set_source_rgb(1, 1, 1)
-            cr.fill()
+            p.save()
+            p.translate(sx * ex, ey)
+            p.scale(1, blink)
+            ellipse(p, 0, 0, 0.2 * R, 0.25 * R, C(1, 1, 1))
             px, py = lookx * 0.07 * R, looky * 0.08 * R
-            cr.arc(px, py + 0.02 * R, 0.13 * R, 0, 2 * math.pi)
-            cr.set_source_rgb(*dark)
-            cr.fill()
-            cr.arc(px - 0.045 * R, py - 0.03 * R, 0.045 * R, 0, 2 * math.pi)
-            cr.set_source_rgb(1, 1, 1)
-            cr.fill()
-            cr.restore()
-        # smile
-        cr.set_line_width(0.065 * R)
-        cr.set_source_rgb(*dark)
-        cr.arc(0, 0.16 * R, 0.17 * R, math.pi * 0.18, math.pi * 0.82)
-        cr.stroke()
+            ellipse(p, px, py + 0.02 * R, 0.13 * R, 0.13 * R, dark)
+            ellipse(p, px - 0.045 * R, py - 0.03 * R, 0.045 * R, 0.045 * R, C(1, 1, 1))
+            p.restore()
+        stroke(p, arc_path(0, 0.16 * R, 0.17 * R, math.pi * 0.18, math.pi * 0.82), dark, 0.065 * R)
 
-    def _draw_bubble(self, cr):
+    def _draw_bubble(self, p):
         if self.bubble_vis <= 0.001:
-            if self.state != "idle":
-                self.buttons = {}
             return
-        u, R = self.u, self.R
+        u, R, pad = self.u, self.R, self.pad
         W, H = self.W, self.H
         x, y = self.pos
-        oy = self.body_offset() * 0.35  # bubble follows bob gently
-        pad = 20 * u
         bw = self.bw
         inner = bw - 2 * pad
         celebrate = self.state == "celebrate" or self.result == "drank"
 
-        if celebrate:
-            title = f"Great job, {self.name}!" if self.count < self.goal else "Daily goal reached!"
-            sub = (f"+{self.ml} ml logged. Your body says thank you."
-                   if self.count < self.goal else "You're a hydration hero today. Keep sipping!")
-        else:
-            title = f"Time to drink water, {self.name}!"
-            sub = self.tip
-        tl = make_layout(cr, title, 19 * u, bold=True, width=inner - 58 * u)
-        sl = make_layout(cr, sub, 13.5 * u, width=inner)
-        tw, th = tl.get_pixel_size()
-        sw, sh = sl.get_pixel_size()
-        prog_h = 24 * u
+        title, sub = self._texts(celebrate)
+        f_title, f_sub = make_font(19 * u, True), make_font(13.5 * u)
+        th = text_height(f_title, title, inner - 58 * u)
+        sh = text_height(f_sub, sub, inner)
         btn_h = 0 if celebrate else 42 * u
-        bh = pad + max(th, 26 * u) + 6 * u + sh + 14 * u + prog_h + (14 * u + btn_h if btn_h else 0) + pad
+        bh = self._bh(th, sh, celebrate)
 
         bx = clamp(x - bw / 2, 14 * u, W - bw - 14 * u)
         drop_top = y + self.body_offset() - 1.75 * R
-        by = drop_top - 24 * u - bh + oy
-        below = by < 10 * u
-        if below:
-            by = y + R + 26 * u + oy
-        by = clamp(by, 8 * u, H - bh - 8 * u)
+        by = max(8 * u, drop_top - self.gap - bh)
         self.bubble_rect = (bx, by, bw, bh)
 
         tail_x = clamp(x, bx + 28 * u, bx + bw - 28 * u)
-        tail_y = by if below else by + bh
+        tail_y = by + bh
         vis = self.bubble_vis
-        sc = ease_out_back(vis) if self.state in ("idle", "celebrate") else vis
-        alpha = clamp(vis * 1.5, 0, 1)
+        sc = max(0.01, ease_out_back(vis) if self.state in ("idle", "celebrate") else vis)
 
-        cr.save()
-        cr.translate(tail_x, tail_y)
-        cr.scale(max(0.01, sc), max(0.01, sc))
-        cr.translate(-tail_x, -tail_y)
-        cr.push_group()
+        p.save()
+        p.setOpacity(clamp(vis * 1.5, 0, 1))
+        p.translate(tail_x, tail_y)
+        p.scale(sc, sc)
+        p.translate(-tail_x, -tail_y)
 
-        # shadow
-        for i in range(5):
-            rounded_rect(cr, bx - i * 2, by + 8 * u - i * 2, bw + i * 4, bh + i * 4, 20 * u + i * 2)
-            cr.set_source_rgba(0.04, 0.16, 0.36, 0.045)
-            cr.fill()
-        # body + tail
-        rounded_rect(cr, bx, by, bw, bh, 20 * u)
-        g = cairo.LinearGradient(0, by, 0, by + bh)
-        g.add_color_stop_rgb(0, 1, 1, 1)
-        g.add_color_stop_rgb(1, 0.94, 0.97, 1.0)
-        cr.set_source(g)
-        cr.fill_preserve()
-        cr.set_line_width(1.5 * u)
-        cr.set_source_rgba(0.55, 0.78, 1.0, 0.9)
-        cr.stroke()
-        tdir = -1 if below else 1
-        cr.move_to(tail_x - 13 * u, tail_y - tdir * 2 * u)
-        cr.line_to(tail_x + 13 * u, tail_y - tdir * 2 * u)
-        cr.line_to(tail_x + (x - tail_x) * 0.3, tail_y + tdir * 17 * u)
-        cr.close_path()
-        cr.set_source_rgb(0.94, 0.97, 1.0) if not below else cr.set_source_rgb(1, 1, 1)
-        cr.fill_preserve()
-        cr.set_source_rgba(0.55, 0.78, 1.0, 0.9)
-        cr.set_line_width(1.5 * u)
-        cr.stroke()
-        cr.move_to(tail_x - 12 * u, tail_y)
-        cr.line_to(tail_x + 12 * u, tail_y)
-        cr.set_line_width(3 * u)
-        cr.set_source_rgb(0.94, 0.97, 1.0) if not below else cr.set_source_rgb(1, 1, 1)
-        cr.stroke()
+        for i in range(5):  # soft shadow
+            fill(p, rounded(bx - i * 2, by + 8 * u - i * 2, bw + i * 4, bh + i * 4, 20 * u + i * 2),
+                 C(0.04, 0.16, 0.36, 0.045))
+        bottom_col = C(0.94, 0.97, 1.0)
+        box = rounded(bx, by, bw, bh, 20 * u)
+        fill(p, box, lin(0, by, 0, by + bh, [(0, C(1, 1, 1)), (1, bottom_col)]))
+        stroke(p, box, C(0.55, 0.78, 1.0, 0.9), 1.5 * u)
+        tip = QPointF(tail_x + (x - tail_x) * 0.3, tail_y + 17 * u)
+        tail = QPainterPath()
+        tail.addPolygon(QPolygonF([QPointF(tail_x - 13 * u, tail_y - 2 * u), QPointF(tail_x + 13 * u, tail_y - 2 * u),
+                                   tip]))
+        tail.closeSubpath()
+        fill(p, tail, bottom_col)
+        edges = QPainterPath(QPointF(tail_x - 13 * u, tail_y))
+        edges.lineTo(tip)
+        edges.lineTo(QPointF(tail_x + 13 * u, tail_y))
+        stroke(p, edges, C(0.55, 0.78, 1.0, 0.9), 1.5 * u)
 
-        # header icon (mini drop)
-        cy = by + pad + max(th, 26 * u) / 2
-        cr.save()
-        cr.translate(bx + pad + 11 * u, cy + 4 * u)
-        drop_path(cr, 8 * u)
-        ig = cairo.LinearGradient(-8 * u, -14 * u, 8 * u, 8 * u)
-        ig.add_color_stop_rgb(0, 0.6, 0.9, 1.0)
-        ig.add_color_stop_rgb(1, 0.1, 0.45, 0.92)
-        cr.set_source(ig)
-        cr.fill()
-        cr.restore()
-        show_layout(cr, tl, bx + pad + 30 * u, cy - th / 2, (0.05, 0.18, 0.38, 1))
+        th_box = max(th, 26 * u)
+        cy = by + pad + th_box / 2
+        fill(p, drop_path(8 * u, bx + pad + 11 * u, cy + 4 * u),
+             lin(bx + pad + 3 * u, cy - 10 * u, bx + pad + 19 * u, cy + 12 * u,
+                 [(0, C(0.6, 0.9, 1.0)), (1, C(0.1, 0.45, 0.92))]))
+        p.setFont(f_title)
+        p.setPen(C(0.05, 0.18, 0.38))
+        p.drawText(QRectF(bx + pad + 30 * u, cy - th / 2 - 1, inner - 58 * u, th + 4),
+                   int(Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop), title)
 
-        # close (skip) button
-        if not celebrate:
-            ccx, ccy, cr_r = bx + bw - pad - 4 * u, by + pad + 6 * u, 12 * u
+        self.buttons = {}
+        if not celebrate:  # close (skip) button
+            ccx, ccy, cr = bx + bw - pad - 4 * u, by + pad + 6 * u, 12 * u
             hov = self.hover == "skip"
-            cr.arc(ccx, ccy, cr_r, 0, 2 * math.pi)
-            cr.set_source_rgba(0.85, 0.91, 0.98, 1 if hov else 0.0)
-            cr.fill()
-            cr.set_line_width(2 * u)
-            cr.set_line_cap(cairo.LINE_CAP_ROUND)
-            cr.set_source_rgba(0.35, 0.45, 0.58, 1 if hov else 0.7)
+            if hov:
+                ellipse(p, ccx, ccy, cr, cr, C(0.85, 0.91, 0.98))
             k = 4.5 * u
-            cr.move_to(ccx - k, ccy - k)
-            cr.line_to(ccx + k, ccy + k)
-            cr.move_to(ccx + k, ccy - k)
-            cr.line_to(ccx - k, ccy + k)
-            cr.stroke()
-            self.buttons["skip"] = (ccx - cr_r - 4 * u, ccy - cr_r - 4 * u, 2 * cr_r + 8 * u, 2 * cr_r + 8 * u)
+            xp = QPainterPath()
+            xp.moveTo(ccx - k, ccy - k)
+            xp.lineTo(ccx + k, ccy + k)
+            xp.moveTo(ccx + k, ccy - k)
+            xp.lineTo(ccx - k, ccy + k)
+            stroke(p, xp, C(0.35, 0.45, 0.58, 1 if hov else 0.7), 2 * u)
+            self.buttons["skip"] = (ccx - cr - 4 * u, ccy - cr - 4 * u, 2 * cr + 8 * u, 2 * cr + 8 * u)
 
-        yy = by + pad + max(th, 26 * u) + 6 * u
-        show_layout(cr, sl, bx + pad, yy, (0.33, 0.42, 0.53, 1))
+        yy = by + pad + th_box + 6 * u
+        p.setFont(f_sub)
+        p.setPen(C(0.33, 0.42, 0.53))
+        p.drawText(QRectF(bx + pad, yy, inner, sh + 4), int(Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop), sub)
         yy += sh + 14 * u
 
         # progress: little glasses
-        gw, gh_ = 14 * u, 20 * u
-        gap = 6 * u
-        n = self.goal if self.goal <= 12 else 12
+        gw, gh = 14 * u, 20 * u
+        n = min(self.goal, 12)
         for i in range(n):
-            gx = bx + pad + i * (gw + gap)
+            gx = bx + pad + i * (gw + 6 * u)
             filled = i < self.count
-            cr.save()
-            glass_path(cr, gx, yy + 2 * u, gw, gh_)
-            cr.set_source_rgba(0.88, 0.94, 1.0, 1)
-            cr.fill_preserve()
+            gp = glass_path(gx, yy + 2 * u, gw, gh)
+            fill(p, gp, C(0.88, 0.94, 1.0))
             if filled:
-                cr.clip()
-                fill_top = yy + 2 * u + gh_ * 0.22
                 pop = 1.0
-                if celebrate and i == self.count - 1:
-                    pop = clamp(self.state_t / 0.6, 0, 1) if self.state == "celebrate" else 1
-                cr.rectangle(gx, fill_top + (1 - pop) * gh_, gw, gh_)
-                fg = cairo.LinearGradient(0, fill_top, 0, yy + 2 * u + gh_)
-                fg.add_color_stop_rgb(0, 0.45, 0.82, 1.0)
-                fg.add_color_stop_rgb(1, 0.12, 0.48, 0.95)
-                cr.set_source(fg)
-                cr.fill()
-            cr.restore()
-            glass_path(cr, gx, yy + 2 * u, gw, gh_)
-            cr.set_line_width(1.5 * u)
-            cr.set_line_join(cairo.LINE_JOIN_ROUND)
-            cr.set_source_rgba(0.30, 0.58, 0.92, 1 if filled else 0.55)
-            cr.stroke()
-        extra = f"  +{self.count - self.goal}" if self.count > self.goal else ""
+                if self.state == "celebrate" and i == self.count - 1:
+                    pop = clamp(self.state_t / 0.6, 0, 1)
+                top = yy + 2 * u + gh * 0.22 + (1 - pop) * gh
+                p.save()
+                p.setClipPath(gp)
+                p.fillRect(QRectF(gx, top, gw, gh), lin(0, top, 0, yy + 2 * u + gh,
+                                                          [(0, C(0.45, 0.82, 1.0)), (1, C(0.12, 0.48, 0.95))]))
+                p.restore()
+            stroke(p, gp, C(0.30, 0.58, 0.92, 1 if filled else 0.55), 1.5 * u)
         vol = self.count * self.ml
         vol_s = f"{vol} ml" if vol < 1000 else f"{vol / 1000:.2f}".rstrip("0").rstrip(".") + " L"
-        pl = make_layout(cr, f"{self.count}/{self.goal}{extra}  ·  {vol_s}",
-                         12.5 * u, bold=True)
-        pw_, ph_ = pl.get_pixel_size()
-        show_layout(cr, pl, bx + bw - pad - pw_, yy + 2 * u + (gh_ - ph_) / 2, (0.18, 0.45, 0.82, 1))
-        yy += prog_h + 14 * u
+        extra = f"  +{self.count - self.goal}" if self.count > self.goal else ""
+        f_prog = make_font(12.5 * u, True)
+        p.setFont(f_prog)
+        p.setPen(C(0.18, 0.45, 0.82))
+        p.drawText(QRectF(bx + pad, yy + 2 * u, inner, gh), int(Qt.AlignRight | Qt.AlignVCenter),
+                   f"{self.count}/{self.goal}{extra}  ·  {vol_s}")
+        yy += 24 * u + 14 * u
 
-        # buttons
         if btn_h:
             prim_w = inner * 0.58
-            sec_w = inner - prim_w - 10 * u
-            self._button(cr, "drank", bx + pad, yy, prim_w, btn_h, "I drank a glass", True)
-            self._button(cr, "snooze", bx + pad + prim_w + 10 * u, yy, sec_w, btn_h,
+            self._button(p, "drank", bx + pad, yy, prim_w, btn_h, "I drank a glass", True)
+            self._button(p, "snooze", bx + pad + prim_w + 10 * u, yy, inner - prim_w - 10 * u, btn_h,
                          f"Snooze {self.snooze} min", False)
+        p.restore()
 
-        cr.pop_group_to_source()
-        cr.paint_with_alpha(alpha)
-        cr.restore()
-
-    def _button(self, cr, bid, x, y, w, h, label, primary):
+    def _button(self, p, bid, x, y, w, h, label, primary):
         u = self.u
         hov = self.hover == bid
         lift = -1.5 * u if hov else 0
+        self.buttons[bid] = (x, y, w, h)
         y += lift
         if primary:
-            rounded_rect(cr, x, y + 3 * u, w, h, h / 2)
-            cr.set_source_rgba(0.1, 0.4, 0.85, 0.25)
-            cr.fill()
-            rounded_rect(cr, x, y, w, h, h / 2)
-            g = cairo.LinearGradient(x, y, x + w, y + h)
-            if hov:
-                g.add_color_stop_rgb(0, 0.36, 0.78, 1.0)
-                g.add_color_stop_rgb(1, 0.16, 0.52, 1.0)
-            else:
-                g.add_color_stop_rgb(0, 0.28, 0.70, 1.0)
-                g.add_color_stop_rgb(1, 0.10, 0.44, 0.94)
-            cr.set_source(g)
-            cr.fill()
-            fg = (1, 1, 1, 1)
+            fill(p, rounded(x, y + 3 * u, w, h, h / 2), C(0.1, 0.4, 0.85, 0.25))
+            stops = ([(0, C(0.36, 0.78, 1.0)), (1, C(0.16, 0.52, 1.0))] if hov else
+                     [(0, C(0.28, 0.70, 1.0)), (1, C(0.10, 0.44, 0.94))])
+            fill(p, rounded(x, y, w, h, h / 2), lin(x, y, x + w, y + h, stops))
+            fg = C(1, 1, 1)
         else:
-            rounded_rect(cr, x, y, w, h, h / 2)
-            cr.set_source_rgb(*((0.84, 0.92, 1.0) if hov else (0.90, 0.95, 1.0)))
-            cr.fill_preserve()
-            cr.set_line_width(1.2 * u)
-            cr.set_source_rgba(0.55, 0.75, 0.98, 1)
-            cr.stroke()
-            fg = (0.12, 0.40, 0.80, 1)
-        lay = make_layout(cr, label, (15 if primary else 13.5) * u, bold=primary)
-        lw, lh = lay.get_pixel_size()
-        show_layout(cr, lay, x + (w - lw) / 2, y + (h - lh) / 2, fg)
-        self.buttons[bid] = (x, y - lift, w, h)
+            box = rounded(x, y, w, h, h / 2)
+            fill(p, box, C(0.84, 0.92, 1.0) if hov else C(0.90, 0.95, 1.0))
+            stroke(p, box, C(0.55, 0.75, 0.98), 1.2 * u)
+            fg = C(0.12, 0.40, 0.80)
+        p.setFont(make_font((15 if primary else 13.5) * u, primary))
+        p.setPen(fg)
+        p.drawText(QRectF(x, y, w, h), int(Qt.AlignCenter), label)
 
 
 # --------------------------------------------------------------------------- #
-# GTK overlay window
+# Windows
 # --------------------------------------------------------------------------- #
-class Overlay(Gtk.Window):
+def _overlay_flags(click_through):
+    flags = Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus
+    if IS_LINUX:
+        flags |= Qt.X11BypassWindowManagerHint
+    if click_through:
+        flags |= Qt.WindowTransparentForInput
+    return flags
+
+
+class MascotWindow(QWidget):
+    def __init__(self, overlay):
+        super().__init__(None, _overlay_flags(False))
+        self.overlay = overlay
+        self.scene = overlay.scene
+        if not self.scene.compact:
+            self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        if IS_MAC:
+            self.setAttribute(Qt.WA_MacAlwaysShowToolWindow)
+        self.setWindowTitle(APP_NAME)
+        self.setMouseTracking(True)
+        self.resize(self.scene.win_w, self.scene.win_h)
+        self.origin = (0, 0)
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        ox, oy = self.origin
+        p.translate(-ox, -oy)
+        self.scene.draw_mascot(p, (ox, oy, self.width(), self.height()))
+        p.end()
+
+    def _scene_pos(self, ev):
+        pos = ev.position()
+        return pos.x() + self.origin[0], pos.y() + self.origin[1]
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self.overlay.click(*self._scene_pos(ev))
+
+
+class FxWindow(QWidget):
+    def __init__(self, overlay):
+        super().__init__(None, _overlay_flags(True))
+        self.scene = overlay.scene
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        if IS_MAC:
+            self.setAttribute(Qt.WA_MacAlwaysShowToolWindow)
+        self.setWindowTitle(APP_NAME + " wave")
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.translate(0, -(self.scene.H - self.scene.fx_h))
+        self.scene.draw_fx(p)
+        p.end()
+
+
+class Overlay:
+    """One reminder appearance: creates the windows and drives the animation."""
+
     def __init__(self, cfg, count, on_done):
-        super().__init__(type=Gtk.WindowType.POPUP)
         self.on_done = on_done
-        display = Gdk.Display.get_default()
-        self.pointer_dev = display.get_default_seat().get_pointer()
-        _, px, py = self.pointer_dev.get_position()
-        monitor = display.get_monitor_at_point(px, py) or display.get_primary_monitor() or display.get_monitor(0)
-        geo = monitor.get_geometry()
-
-        screen = self.get_screen()
-        visual = screen.get_rgba_visual()
-        composited = visual is not None and screen.is_composited()
-        if composited:
-            self.set_visual(visual)
-            W, H, ox, oy = geo.width, geo.height, geo.x, geo.y
-        else:  # no compositor: small opaque card in the bottom-right corner
-            W, H = 420, 400
-            ox, oy = geo.x + geo.width - W - 24, geo.y + geo.height - H - 64
-        self.origin = (ox, oy)
-        self.compact = not composited
-
-        self.set_app_paintable(True)
-        self.set_title("Water Reminder")
-        self.set_default_size(W, H)
-        self.move(ox, oy)
-        self.resize(W, H)
-        self.scene = Scene(W, H, cfg, count, user_first_name(cfg), compact=self.compact)
-
-        self.add_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
-        self.connect("draw", self._on_draw)
-        self.connect("button-press-event", self._on_click)
-        self.connect("motion-notify-event", self._on_motion)
-        self.connect("realize", lambda *_: self._update_input_shape())
-        self._cursor_hand = Gdk.Cursor.new_from_name(display, "pointer")
-        self._cursor_cur = None
-        self.show_all()
-        self._last = time.monotonic()
+        screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+        self.avail = screen.availableGeometry()
+        self.x11 = is_x11()
+        compact = self.x11 and not _X11.has_compositor()
+        self.scene = Scene(self.avail.width(), self.avail.height(), cfg, count, user_first_name(cfg), compact)
+        self.fx = None
+        if not compact:
+            self.fx = FxWindow(self)
+            self.fx.setGeometry(self.avail.x(), self.avail.y() + self.avail.height() - self.scene.fx_h,
+                                self.avail.width(), self.scene.fx_h)
+            self.fx.show()
+        self.mascot = MascotWindow(self)
+        if compact:
+            self.mascot.move(self.avail.right() - self.scene.win_w - 16,
+                             self.avail.bottom() - self.scene.win_h - 16)
+        else:
+            self._place()
+        self.mascot.show()
+        self.mascot.raise_()
+        self._cursor_hand = False
+        self._frame = 0
         self._finished = False
-        GLib.timeout_add(16, self._tick)
+        self.clock = QElapsedTimer()
+        self.clock.start()
+        self.timer = QTimer()
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(16)
 
-    def _on_draw(self, _w, cr):
-        cr.set_operator(cairo.OPERATOR_SOURCE)
-        cr.set_source_rgba(0, 0, 0, 0)
-        cr.paint()
-        cr.set_operator(cairo.OPERATOR_OVER)
-        self.scene.draw(cr)
-        return True
+    def _place(self):
+        ox, oy = self.scene.origin()
+        ox, oy = math.floor(ox), math.floor(oy)
+        self.mascot.origin = (ox, oy)
+        self.mascot.move(self.avail.x() + ox, self.avail.y() + oy)
 
-    def _on_motion(self, _w, ev):
-        self._set_hover(ev.x, ev.y)
-
-    def _set_hover(self, x, y):
-        h = self.scene.hit(x, y)
-        self.scene.hover = h
-        want = self._cursor_hand if h else None
-        if want is not self._cursor_cur and self.get_window():
-            self.get_window().set_cursor(want)
-            self._cursor_cur = want
-
-    def _on_click(self, _w, ev):
-        if ev.button != 1:
-            return False
-        h = self.scene.hit(ev.x, ev.y)
+    def click(self, sx, sy):
+        h = self.scene.hit(sx, sy)
         if h == "drop":
             self.scene.poke()
         elif h in ("drank", "snooze", "skip"):
-            if h == "drank":
-                play_sound("done") if self.scene.cfg.get("sound", True) else None
+            if h == "drank" and self.scene.cfg.get("sound", True):
+                play_sound("done")
             self.scene.leave(h)
-        return True
 
     def _tick(self):
-        now = time.monotonic()
-        dt = min(0.05, now - self._last)
-        self._last = now
-        try:
-            _, px, py = self.pointer_dev.get_position()
-            p = (px - self.origin[0], py - self.origin[1])
-            if 0 <= p[0] <= self.scene.W and 0 <= p[1] <= self.scene.H:
-                self.scene.pointer = p
-                self._set_hover(*p)
-        except Exception:
-            pass
-        self.scene.update(dt)
-        if self.scene.done:
+        dt = min(0.05, self.clock.restart() / 1000.0)
+        s = self.scene
+        gp = QCursor.pos()
+        if self.scene.compact:
+            wp = self.mascot.pos()
+            px, py = gp.x() - wp.x(), gp.y() - wp.y()
+        else:
+            px, py = gp.x() - self.avail.x(), gp.y() - self.avail.y()
+        s.pointer = (px, py)
+        s.hover = s.hit(px, py)
+        want_hand = s.hover is not None
+        if want_hand != self._cursor_hand:
+            self.mascot.setCursor(Qt.PointingHandCursor if want_hand else Qt.ArrowCursor)
+            self._cursor_hand = want_hand
+
+        s.update(dt)
+        if s.done:
             self._finish()
-            return False
-        self._update_input_shape()
-        self.queue_draw()
-        return True
+            return
+        if not s.compact:
+            self._place()
+            self._frame += 1
+            if self.x11 and self._frame % 2 == 0:
+                self._update_input_shape()
+            if self._frame % 120 == 0:
+                self.mascot.raise_()
+        self.mascot.update()
+        if self.fx:
+            self.fx.update()
 
     def _update_input_shape(self):
-        if self.compact:
-            return
-        rects = [cairo.RectangleInt(int(x), int(y), int(w) + 1, int(h) + 1)
+        ox, oy = self.mascot.origin
+        dpr = self.mascot.devicePixelRatioF()
+        rects = [((x - ox) * dpr, (y - oy) * dpr, w * dpr, h * dpr)
                  for (x, y, w, h) in self.scene.hit_rects(pad=4)]
         try:
-            self.input_shape_combine_region(cairo.Region(rects))
+            _X11.set_input_rects(self.mascot.winId(), rects)
         except Exception:
             pass
 
@@ -1198,138 +1278,398 @@ class Overlay(Gtk.Window):
         if self._finished:
             return
         self._finished = True
+        self.timer.stop()
         result = self.scene.result or "timeout"
-        self.destroy()
+        self.mascot.close()
+        self.mascot.deleteLater()
+        if self.fx:
+            self.fx.close()
+            self.fx.deleteLater()
         self.on_done(result)
 
 
 # --------------------------------------------------------------------------- #
-# Background service
+# Background service + tray icon
 # --------------------------------------------------------------------------- #
-class ReminderService:
-    def __init__(self, once=False):
+def drop_icon(size=64):
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    R = size * 0.30
+    cx, cy = size / 2, size * 0.62
+    fill(p, drop_path(R, cx, cy), lin(cx - R, cy - 1.75 * R, cx + R, cy + R,
+                                      [(0, C(0.66, 0.92, 1.0)), (0.5, C(0.26, 0.66, 0.98)), (1, C(0.07, 0.37, 0.84))]))
+    ellipse(p, cx - 0.4 * R, cy - 0.35 * R, 0.16 * R, 0.36 * R, C(1, 1, 1, 0.6))
+    p.end()
+    return QIcon(pm)
+
+
+class Service:
+    def __init__(self, app, once=False):
+        self.app = app
         self.once = once
-        self.timer = None
         self.overlay = None
+        self.next_at = None
+        self.paused_until = None
+        self.timer = QTimer()
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(lambda: self._fire(False))
+        self.tray = None
+        if not once and QSystemTrayIcon.isSystemTrayAvailable():
+            self._make_tray()
 
+    # scheduling
     def schedule(self, minutes):
-        if self.timer:
-            GLib.source_remove(self.timer)
-        self.timer = GLib.timeout_add_seconds(max(1, int(minutes * 60)), self._fire)
-        when = datetime.datetime.now() + datetime.timedelta(minutes=minutes)
-        print(f"[{APP}] next reminder at {when:%H:%M}", flush=True)
+        minutes = max(0.05, float(minutes))
+        self.timer.start(int(minutes * 60000))
+        self.next_at = datetime.datetime.now() + datetime.timedelta(minutes=minutes)
+        print(f"[{APP_ID}] next reminder at {self.next_at:%H:%M}", flush=True)
+        self._refresh_tray()
 
-    def _fire(self, force=False):
-        self.timer = None
+    def _fire(self, force):
         cfg = load_config()
-        if not force and in_quiet_hours(cfg):
-            self.schedule(cfg["interval_minutes"])
-            return False
+        now = datetime.datetime.now()
+        if not force:
+            if self.paused_until and now < self.paused_until:
+                self.schedule((self.paused_until - now).total_seconds() / 60 + 0.1)
+                return
+            if in_quiet_hours(cfg):
+                self.schedule(cfg["interval_minutes"])
+                return
+        self.paused_until = None
         self.show(cfg)
-        return False
 
     def show(self, cfg=None):
         if self.overlay is not None:
             return
         cfg = cfg or load_config()
-        st = load_state()
+        self.timer.stop()
         if cfg.get("sound", True):
             play_sound("reminder")
-        self.overlay = Overlay(cfg, st["count"], self._done)
-
-    def show_now(self, *_):
-        if self.timer:
-            GLib.source_remove(self.timer)
-            self.timer = None
-        self._fire(force=True)
-        return True  # keep signal handler installed
+        self.overlay = Overlay(cfg, load_state()["count"], self._done)
 
     def _done(self, result):
         self.overlay = None
         cfg = load_config()
         if result == "drank":
-            st = load_state()
-            st["count"] += 1
-            save_state(st)
+            self.log_glass()
         if self.once:
-            Gtk.main_quit()
+            QTimer.singleShot(100, self.app.quit)
             return
         self.schedule(cfg["snooze_minutes"] if result == "snooze" else cfg["interval_minutes"])
 
+    def log_glass(self):
+        st = load_state()
+        st["count"] += 1
+        save_state(st)
+        self._refresh_tray()
 
-def read_pid():
+    def command(self, cmd):
+        cmd = cmd.strip()
+        if cmd == "show":
+            self._fire(True)
+        elif cmd == "quit":
+            self.app.quit()
+
+    # tray
+    def _make_tray(self):
+        self.tray = QSystemTrayIcon(drop_icon(), self.app)
+        menu = QMenu()
+        self.a_now = QAction("Remind me now", menu, triggered=lambda: self._fire(True))
+        self.a_log = QAction("Log a glass", menu, triggered=self.log_glass)
+        self.a_today = QAction("", menu, enabled=False)
+        self.a_next = QAction("", menu, enabled=False)
+        self.a_pause = QAction("Pause for 1 hour", menu, triggered=self._toggle_pause)
+        self.a_settings = QAction("Settings…", menu, triggered=self._open_settings)
+        self.a_quit = QAction("Quit Water Reminder", menu, triggered=self.app.quit)
+        for a in (self.a_now, self.a_log, None, self.a_today, self.a_next, None, self.a_pause,
+                  self.a_settings, None, self.a_quit):
+            menu.addSeparator() if a is None else menu.addAction(a)
+        menu.aboutToShow.connect(self._refresh_tray)
+        self._menu = menu
+        self.tray.setContextMenu(menu)
+        self.tray.show()
+        self._refresh_tray()
+
+    def _refresh_tray(self):
+        if not self.tray:
+            return
+        cfg, st = load_config(), load_state()
+        today = f"Today: {st['count']}/{cfg['daily_goal_glasses']} glasses ({st['count'] * cfg['glass_ml']} ml)"
+        if self.paused_until:
+            nxt = f"Paused until {self.paused_until:%H:%M}"
+        else:
+            nxt = f"Next reminder: {self.next_at:%H:%M}" if self.next_at else "Next reminder: –"
+        self.a_today.setText(today)
+        self.a_next.setText(nxt)
+        self.a_pause.setText("Resume reminders" if self.paused_until else "Pause for 1 hour")
+        self.tray.setToolTip(f"{APP_NAME}\n{today}\n{nxt}")
+
+    def _toggle_pause(self):
+        if self.paused_until:
+            self.paused_until = None
+            self.schedule(load_config()["interval_minutes"])
+        else:
+            self.paused_until = datetime.datetime.now() + datetime.timedelta(hours=1)
+            self.schedule(60.1)
+        self._refresh_tray()
+
+    def _open_settings(self):
+        load_config()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(CONFIG_FILE))
+
+
+def send_command(cmd, timeout=800):
+    sock = QLocalSocket()
+    sock.connectToServer(SERVER_NAME)
+    if not sock.waitForConnected(timeout):
+        return False
+    sock.write((cmd + "\n").encode())
+    sock.flush()
+    sock.waitForBytesWritten(timeout)
+    sock.disconnectFromServer()
+    return True
+
+
+def start_server(service):
+    QLocalServer.removeServer(SERVER_NAME)
+    server = QLocalServer()
+    server.setSocketOptions(QLocalServer.UserAccessOption)
+    if not server.listen(SERVER_NAME):
+        print(f"[{APP_ID}] could not open control socket: {server.errorString()}", file=sys.stderr)
+
+    def on_conn():
+        conn = server.nextPendingConnection()
+
+        def on_read():
+            for line in bytes(conn.readAll()).decode(errors="ignore").split():
+                service.command(line)
+        conn.readyRead.connect(on_read)
+        conn.disconnected.connect(conn.deleteLater)
+    server.newConnection.connect(on_conn)
+    return server
+
+
+# --------------------------------------------------------------------------- #
+# Install / uninstall (start at login)
+# --------------------------------------------------------------------------- #
+MAC_PLIST = _home("Library", "LaunchAgents", "com.waterreminder.agent.plist")
+LINUX_AUTOSTART = os.path.join(os.environ.get("XDG_CONFIG_HOME") or _home(".config"), "autostart",
+                               "water-reminder.desktop")
+LINUX_LAUNCHER = os.path.join(os.environ.get("XDG_DATA_HOME") or _home(".local", "share"), "applications",
+                              "water-reminder.desktop")
+LINUX_BIN = _home(".local", "bin", "water-reminder")
+WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+WIN_START_MENU = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs",
+                              "Water Reminder.lnk")
+
+
+def _gui_python():
+    py = sys.executable
+    if IS_WIN:
+        pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
+        if os.path.exists(pyw):
+            return pyw
+    return py
+
+
+def _stop_old_linux_daemon():
+    """Stop the earlier GTK-based version if it is running."""
+    pid_file = os.path.join(DATA_DIR, "daemon.pid")
     try:
-        with open(PID_FILE) as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 0)
-        return pid
+        with open(pid_file) as f:
+            os.kill(int(f.read().strip()), signal.SIGTERM)
     except Exception:
-        return None
-
-
-def run_daemon():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    lock = open(LOCK_FILE, "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        print(f"[{APP}] already running.")
-        return 0
-    cfg = load_config()
-    svc = ReminderService()
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, svc.show_now)
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda *_: (Gtk.main_quit(), False)[1])
-    # publish the pid only once signal handlers exist (so --now can't kill us)
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
-    print(f"[{APP}] running - every {cfg['interval_minutes']} min "
-          f"(quiet {cfg['quiet_hours']['start']}-{cfg['quiet_hours']['end']})", flush=True)
-    svc.schedule(cfg["interval_minutes"])
-    Gtk.main()
-    try:
-        os.remove(PID_FILE)
-    except OSError:
         pass
+    for fn in ("daemon.pid", "daemon.lock"):
+        try:
+            os.remove(os.path.join(DATA_DIR, fn))
+        except OSError:
+            pass
+
+
+def do_install():
+    os.makedirs(APP_DIR, exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    src = os.path.abspath(__file__)
+    dst = os.path.join(APP_DIR, "water_reminder.py")
+    if os.path.abspath(src) != os.path.abspath(dst):
+        shutil.copy2(src, dst)
+    load_config()
+    py = _gui_python()
+
+    if send_command("quit"):
+        time.sleep(1.0)
+
+    if IS_WIN:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "WaterReminder", 0, winreg.REG_SZ, f'"{py}" "{dst}"')
+        ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{WIN_START_MENU}');"
+              f"$s.TargetPath='{py}';$s.Arguments='\"{dst}\" --now';"
+              f"$s.Description='Show the water reminder now';$s.Save()")
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True)
+        subprocess.Popen([py, dst], creationflags=0x00000008 | 0x00000200, close_fds=True)  # detached
+    elif IS_MAC:
+        os.makedirs(os.path.dirname(MAC_PLIST), exist_ok=True)
+        with open(MAC_PLIST, "w") as f:
+            f.write(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.waterreminder.agent</string>
+  <key>ProgramArguments</key>
+  <array><string>{py}</string><string>{dst}</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>StandardOutPath</key><string>{LOG_FILE}</string>
+  <key>StandardErrorPath</key><string>{LOG_FILE}</string>
+</dict>
+</plist>
+""")
+        subprocess.run(["launchctl", "unload", MAC_PLIST], capture_output=True)
+        subprocess.run(["launchctl", "load", "-w", MAC_PLIST], capture_output=True)
+    else:
+        _stop_old_linux_daemon()
+        for path in (LINUX_AUTOSTART, LINUX_LAUNCHER, LINUX_BIN):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(LINUX_BIN, "w") as f:
+            f.write(f'#!/bin/sh\nexec "{py}" "{dst}" "$@"\n')
+        os.chmod(LINUX_BIN, 0o755)
+        entry = ("[Desktop Entry]\nType=Application\nName=Water Reminder\nIcon=weather-showers\n"
+                 "Categories=Utility;\nKeywords=water;drink;hydration;reminder;\n")
+        with open(LINUX_AUTOSTART, "w") as f:
+            f.write(entry + f"Comment=Animated reminder to drink water\nExec={LINUX_BIN}\n"
+                            "X-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Delay=20\n")
+        with open(LINUX_LAUNCHER, "w") as f:
+            f.write(entry + f"Comment=Show the water reminder now\nExec={LINUX_BIN} --now\n")
+        with open(LOG_FILE, "a") as log:
+            subprocess.Popen([py, dst], stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+
+    # wait for the service, then show a first reminder as a demo
+    for _ in range(40):
+        time.sleep(0.25)
+        if send_command("show"):
+            break
+    cfg = load_config()
+    print(f"\nInstalled! A water drop will visit every {cfg['interval_minutes']} minutes "
+          f"and it starts automatically when you log in.")
+    print(f"  Settings: {CONFIG_FILE}")
+    if not IS_WIN:
+        print(f"  Show now: {'water-reminder' if IS_LINUX else 'python3 ' + repr(dst)} --now")
+    print("  Tip: the water-drop icon in your " + ("menu bar" if IS_MAC else "system tray") +
+          " has 'Remind me now', 'Pause' and 'Settings'.")
     return 0
 
 
+def do_uninstall(purge):
+    send_command("quit")
+    if IS_WIN:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, "WaterReminder")
+        except OSError:
+            pass
+        for path in (WIN_START_MENU,):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    elif IS_MAC:
+        subprocess.run(["launchctl", "unload", MAC_PLIST], capture_output=True)
+        try:
+            os.remove(MAC_PLIST)
+        except OSError:
+            pass
+    else:
+        _stop_old_linux_daemon()
+        for path in (LINUX_AUTOSTART, LINUX_LAUNCHER, LINUX_BIN):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    try:
+        os.remove(os.path.join(APP_DIR, "water_reminder.py"))
+    except OSError:
+        pass
+    if purge:
+        shutil.rmtree(DATA_DIR, ignore_errors=True)
+        shutil.rmtree(CONFIG_DIR, ignore_errors=True)
+    print("Water Reminder removed." + ("" if purge else " (Your history and settings were kept.)"))
+    return 0
+
+
+def print_status():
+    cfg, st = load_config(), load_state()
+    if QCoreApplication.instance() is None:
+        QCoreApplication(sys.argv)
+    running = send_command("ping")
+    print(f"Today: {st['count']}/{cfg['daily_goal_glasses']} glasses ({st['count'] * cfg['glass_ml']} ml)")
+    print(f"Reminder service: {'running' if running else 'not running'}")
+    print(f"Interval: every {cfg['interval_minutes']} min   Config: {CONFIG_FILE}")
+    last = sorted(st["history"].items())[-7:]
+    if last:
+        print("Last days: " + "  ".join(f"{d[5:]}:{c}" for d, c in last))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(description="Animated water reminder")
     ap.add_argument("--now", action="store_true", help="show the reminder right now")
     ap.add_argument("--status", action="store_true", help="print today's progress")
     ap.add_argument("--stop", action="store_true", help="stop the background reminder")
+    ap.add_argument("--install", action="store_true", help="start automatically at login")
+    ap.add_argument("--uninstall", action="store_true", help="remove start-at-login")
+    ap.add_argument("--purge", action="store_true", help="with --uninstall: also delete history/settings")
     args = ap.parse_args()
 
     if args.status:
-        cfg, st = load_config(), load_state()
-        pid = read_pid()
-        print(f"Today: {st['count']}/{cfg['daily_goal_glasses']} glasses "
-              f"({st['count'] * cfg['glass_ml']} ml)")
-        print(f"Reminder service: {'running (pid %d)' % pid if pid else 'not running'}")
-        print(f"Interval: every {cfg['interval_minutes']} min   Config: {CONFIG_FILE}")
-        last = sorted(st["history"].items())[-7:]
-        if last:
-            print("Last days: " + "  ".join(f"{d[5:]}:{c}" for d, c in last))
+        return print_status()
+
+    if args.stop or args.install or args.uninstall:
+        QCoreApplication(sys.argv)
+        if args.install:
+            return do_install()
+        if args.uninstall:
+            return do_uninstall(args.purge)
+        print("Stopped." if send_command("quit") else "Not running.")
         return 0
-    if args.stop:
-        pid = read_pid()
-        if pid:
-            os.kill(pid, signal.SIGTERM)
-            print("Stopped.")
-        else:
-            print("Not running.")
-        return 0
+
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setQuitOnLastWindowClosed(False)
+    if IS_MAC:
+        mac_hide_dock_icon()
+
     if args.now:
-        pid = read_pid()
-        if pid:
-            os.kill(pid, signal.SIGUSR1)
+        if send_command("show"):
             return 0
-        svc = ReminderService(once=True)
+        svc = Service(app, once=True)
         svc.show()
-        Gtk.main()
+        return app.exec()
+
+    if send_command("ping"):
+        print(f"[{APP_ID}] already running.")
         return 0
-    return run_daemon()
+    svc = Service(app)
+    server = start_server(svc)  # noqa: F841 (keep a reference)
+    cfg = load_config()
+    print(f"[{APP_ID}] running - every {cfg['interval_minutes']} min "
+          f"(quiet {cfg['quiet_hours']['start']}-{cfg['quiet_hours']['end']})", flush=True)
+    svc.schedule(cfg["interval_minutes"])
+
+    # let Ctrl+C / SIGTERM stop the Qt event loop
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, lambda *_: app.quit())
+    keepalive = QTimer()
+    keepalive.timeout.connect(lambda: None)
+    keepalive.start(500)
+    return app.exec()
 
 
 if __name__ == "__main__":
