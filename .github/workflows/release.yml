@@ -1,9 +1,10 @@
-# Builds the one-click apps for Windows, macOS and Linux.
+# Tests and builds Water Reminder for Windows, macOS and Linux.
 #
-# - Every push / pull request: builds all three and keeps them as downloadable
-#   "artifacts" on the Actions run (handy for testing).
-# - Pushing a version tag (e.g. `git tag v1.2.0 && git push origin v1.2.0`)
-#   also publishes them on the repository's Releases page.
+# - Every push / pull request: runs the test suite on all three systems, builds the
+#   apps, and starts each built app once (smoke test). The apps are kept as
+#   downloadable "artifacts" on the Actions run.
+# - Pushing a version tag (e.g. `git tag v1.4.0 && git push origin v1.4.0`) also
+#   publishes them on the Releases page. Installed copies then update themselves.
 name: Build apps
 
 on:
@@ -18,7 +19,7 @@ permissions:
 
 jobs:
   build:
-    name: Build (${{ matrix.label }})
+    name: Test & build (${{ matrix.label }})
     strategy:
       fail-fast: false
       matrix:
@@ -42,23 +43,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-keysyms1 \
-            libxcb-shape0 libxcb-render-util0 libxcb-image0 libegl1 libxss1
+            libxcb-shape0 libxcb-render-util0 libxcb-image0 libegl1 libxss1 libgl1
 
-      - name: Install build tools
-        run: python -m pip install --upgrade pip "PySide6-Essentials>=6.8" "pyinstaller>=6.10" pillow pyflakes
+      - name: Install tools
+        run: python -m pip install --upgrade pip "PySide6-Essentials>=6.8" "pyinstaller>=6.10" pillow pyflakes pytest
 
-      - name: Check the code
-        run: python -m pyflakes water_reminder.py packaging/build.py
+      - name: Lint
+        run: python -m pyflakes water_reminder.py packaging/build.py tests
 
-      - name: Build
+      - name: Tests
+        run: python -m pytest -q tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+      - name: Build (includes a smoke test of the built app)
         run: python packaging/build.py
-
-      - name: Smoke test (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get install -y xvfb
-          export HOME=$(mktemp -d)
-          xvfb-run -a ./dist/release/WaterReminder-Linux-* --status
 
       - uses: actions/upload-artifact@v4
         with:
@@ -79,8 +78,8 @@ jobs:
           path: release
           merge-multiple: true
 
-      # water_reminder.py lets source installs update themselves;
-      # SHA256SUMS.txt lets every copy verify what it downloads.
+      # water_reminder.py lets Python-based installs update themselves;
+      # SHA256SUMS.txt lets installers and the app verify every download.
       - name: Add update files and checksums
         run: |
           grep -q "APP_VERSION = \"${GITHUB_REF_NAME#v}\"" water_reminder.py || {
@@ -94,13 +93,21 @@ jobs:
           files: release/*
           generate_release_notes: true
           body: |
-            ## Download
+            ## Install or update with one command
+
+            **Windows** (PowerShell):
+            ```powershell
+            irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1 | iex
+            ```
+            **macOS / Linux** (Terminal):
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
+            ```
+            Already installed? The app offers this update by itself, or run the same command again.
+
+            ## Or download a file
             | System | File |
             |---|---|
-            | Windows 10/11 | **WaterReminder-Windows.exe** |
+            | Windows 10/11 | **WaterReminder-Windows.zip** — extract, then open `WaterReminder.exe` |
             | macOS 12+ (Apple Silicon) | **WaterReminder-macOS.dmg** |
             | Linux (x86-64) | **WaterReminder-Linux-x86_64** |
-
-            Just open the file — it installs itself, starts at login, and says hello.
-            Already installed v1.3.0 or newer? It will offer this update by itself.
-            See the README for first-launch tips (Windows SmartScreen / macOS Gatekeeper).

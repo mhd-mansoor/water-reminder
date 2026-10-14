@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Removes Water Reminder (Linux / macOS). Add --purge to also delete your history and settings.
+# Removes Water Reminder (macOS / Linux). Add --purge to also delete your history and settings.
 if [ "$(uname -s)" = "Darwin" ]; then
-  BASE="$HOME/Library/Application Support/WaterReminder"
+  DATA="$HOME/Library/Application Support/WaterReminder"
+  for app in "/Applications/Water Reminder.app" "$HOME/Applications/Water Reminder.app"; do
+    if [ -x "$app/Contents/MacOS/WaterReminder" ]; then
+      "$app/Contents/MacOS/WaterReminder" --uninstall "$@"; rm -rf "$app"; fi
+  done
 else
-  BASE="${XDG_DATA_HOME:-$HOME/.local/share}/water-reminder"
+  DATA="${XDG_DATA_HOME:-$HOME/.local/share}/water-reminder"
+  [ -x "$DATA/app/WaterReminder" ] && "$DATA/app/WaterReminder" --uninstall "$@"
 fi
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -x "$BASE/venv/bin/python" ]; then
-  "$BASE/venv/bin/python" "$HERE/water_reminder.py" --uninstall "$@"
+if [ -x "$DATA/venv/bin/python" ] && [ -f "$DATA/app/water_reminder.py" ]; then
+  "$DATA/venv/bin/python" "$DATA/app/water_reminder.py" --uninstall "$@"
 fi
-rm -rf "$BASE/venv" "$BASE/app"
-echo "Done."
+rm -rf "$DATA/venv" "$DATA/app"
+echo "Water Reminder removed."

@@ -38,7 +38,7 @@ import wave
 from functools import lru_cache
 
 APP_NAME = "Water Reminder"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 UPDATE_REPO = "mhd-mansoor/water-reminder"  # GitHub "owner/repo" that publishes releases
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 APP_ID = "water-reminder"
@@ -104,6 +104,8 @@ DEFAULTS = {
     "pause_when_away": True,    # freeze the countdown while you're away from the computer
     "away_minutes": 5,
     "check_updates": True,      # look for a new version once a day
+    "smart_pacing": True,       # remind a bit sooner when behind, less once the goal is met
+    "reduce_motion": False,     # mascot appears in place, no wave or roaming
 }
 
 TIPS = [
@@ -204,6 +206,40 @@ def undo_glass():
             times.pop()
         save_state(st)
     return st
+
+
+def _hhmm(text, default):
+    try:
+        return datetime.time.fromisoformat(text)
+    except (TypeError, ValueError):
+        return default
+
+
+def next_interval(cfg, count=None, now=None):
+    """Minutes until the next reminder. With smart pacing: a bit sooner when you're behind your
+    goal for this time of day, and less often once the goal is reached."""
+    base = max(1.0, float(cfg.get("interval_minutes", 30)))
+    if not cfg.get("smart_pacing", True):
+        return base
+    goal = max(1, int(cfg.get("daily_goal_glasses", 8)))
+    count = load_state()["count"] if count is None else count
+    if count >= goal:
+        return min(base * 1.5, 180.0)
+    now = now or datetime.datetime.now()
+    q = cfg.get("quiet_hours") or {}
+    day_start, day_end = datetime.time(8, 0), datetime.time(22, 0)
+    if q.get("enabled", True):
+        a, b = _hhmm(q.get("end"), day_start), _hhmm(q.get("start"), day_end)
+        if a < b:  # normal night-time quiet hours: the waking day is end -> start
+            day_start, day_end = a, b
+    start = datetime.datetime.combine(now.date(), day_start)
+    end = datetime.datetime.combine(now.date(), day_end)
+    total = (end - start).total_seconds()
+    done = clamp((now - start).total_seconds(), 0, total)
+    expected = goal * done / total if total > 0 else 0
+    if expected - count >= 2:
+        return max(base * 0.7, 10.0)  # behind: catch up gently
+    return base
 
 
 def in_quiet_hours(cfg):
@@ -643,22 +679,70 @@ class Probes:
         return cls._cached("busy", 10, fn)
 
 
+class _ObjC:
+    """Minimal Objective-C bridge (macOS) – typed objc_msgSend calls via ctypes."""
+    _lib = None
+
+    @classmethod
+    def lib(cls):
+        if cls._lib is None:
+            import ctypes
+            import ctypes.util
+            lib = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+            lib.objc_getClass.restype = ctypes.c_void_p
+            lib.objc_getClass.argtypes = [ctypes.c_char_p]
+            lib.sel_registerName.restype = ctypes.c_void_p
+            lib.sel_registerName.argtypes = [ctypes.c_char_p]
+            cls._lib = lib
+        return cls._lib
+
+    @classmethod
+    def send(cls, obj, selector, *args, restype=None, argtypes=()):
+        import ctypes
+        lib = cls.lib()
+        fn = ctypes.cast(lib.objc_msgSend,
+                         ctypes.CFUNCTYPE(restype or ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, *argtypes))
+        return fn(obj, lib.sel_registerName(selector), *args)
+
+    @classmethod
+    def ns_app(cls):
+        return cls.send(cls.lib().objc_getClass(b"NSApplication"), b"sharedApplication")
+
+
 def mac_hide_dock_icon():
     """Run as a menu-bar-only app (no Dock icon) on macOS."""
     try:
         import ctypes
-        import ctypes.util
-        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
-        objc.objc_getClass.restype = ctypes.c_void_p
-        objc.sel_registerName.restype = ctypes.c_void_p
-        objc.objc_msgSend.restype = ctypes.c_void_p
-        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        ns_app = objc.objc_msgSend(objc.objc_getClass(b"NSApplication"),
-                                   objc.sel_registerName(b"sharedApplication"))
-        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
-        objc.objc_msgSend(ns_app, objc.sel_registerName(b"setActivationPolicy:"), 1)
+        _ObjC.send(_ObjC.ns_app(), b"setActivationPolicy:", 1, restype=ctypes.c_bool, argtypes=(ctypes.c_long,))
     except Exception:
         pass
+
+
+def mac_activate():
+    """Bring our (menu-bar) app to the front so its windows get focus."""
+    try:
+        import ctypes
+        _ObjC.send(_ObjC.ns_app(), b"activateIgnoringOtherApps:", True, argtypes=(ctypes.c_bool,))
+    except Exception:
+        pass
+
+
+def mac_overlay_window(widget):
+    """Make an overlay follow the user to every Space (desktops and full-screen apps) and float above them."""
+    try:
+        import ctypes
+        view = int(widget.winId())
+        win = _ObjC.send(view, b"window")
+        if not win:
+            return
+        # CanJoinAllSpaces | Stationary | IgnoresCycle | FullScreenAuxiliary
+        behaviour = (1 << 0) | (1 << 4) | (1 << 6) | (1 << 8)
+        _ObjC.send(win, b"setCollectionBehavior:", behaviour, argtypes=(ctypes.c_ulong,))
+        _ObjC.send(win, b"setLevel:", 25, argtypes=(ctypes.c_long,))          # NSStatusWindowLevel
+        _ObjC.send(win, b"setHidesOnDeactivate:", False, argtypes=(ctypes.c_bool,))
+        _ObjC.send(win, b"setCanHide:", False, argtypes=(ctypes.c_bool,))
+    except Exception as e:
+        print(f"[{APP_ID}] macOS window setup failed: {e}", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -843,8 +927,10 @@ class Scene:
         self.gap = 24 * u
         self.bh_max = max(self.bubble_height(False), self.bubble_height(True))
         self.margin = 60 * u
-        self.wave_h = 0 if compact else 70 * u
+        self.reduce_motion = bool(cfg.get("reduce_motion", False))
+        self.wave_h = 0 if (compact or self.reduce_motion) else 70 * u
         self.fx_h = int(self.wave_h + 50 * u)
+        self.fx_w = W  # width of the wave strip (the whole screen); set by Overlay
 
         # Layout of the (moving) mascot window, relative to the drop's centre
         self.win_w = int(self.bw + 2 * self.margin)
@@ -863,6 +949,12 @@ class Scene:
         self._setup_roam()
         sx, sy = self.roam_pos(0)
         self.start = (sx, self.H + self.R * 3) if compact else (-self.R * 4, sy + 40 * u)
+        self.fade = 1.0
+        self.enter_dur, self.exit_dur = self.ENTER_DUR, self.EXIT_DUR
+        if self.reduce_motion:  # appear and leave in place with a gentle fade
+            self.start = (sx, sy)
+            self.enter_dur, self.exit_dur = 0.5, 0.6
+            self.fade = 0.0
         self.pos = self.start
         self.vel = (0.0, 0.0)
         self.exit_from = self.exit_to = self.start
@@ -948,7 +1040,7 @@ class Scene:
             self.count += 1
             self.state, self.state_t = "celebrate", 0.0
             self.face = "happy"
-            self._splash(34)
+            self._splash(10 if self.reduce_motion else 34)
         else:
             self.face = "sleepy" if result == "snooze" else "normal"
             self._begin_exit()
@@ -958,7 +1050,9 @@ class Scene:
         x, y = self.pos
         self.exit_from = (x, y)
         u = self.u
-        if self.compact:
+        if self.reduce_motion:
+            self.exit_to = (x, y)
+        elif self.compact:
             self.exit_to = (x, self.H + self.R * 4)
         elif self.result == "snooze":
             self.exit_to = (-self.win_w, y + 60 * u)
@@ -1007,15 +1101,18 @@ class Scene:
         self.speed += ((0.0 if hovered else 1.0) - self.speed) * min(1.0, dt * 4)
 
         if self.state == "enter":
-            k = clamp(self.state_t / self.ENTER_DUR, 0, 1)
+            k = clamp(self.state_t / self.enter_dur, 0, 1)
             e = ease_out_cubic(k)
+            if self.reduce_motion:
+                self.fade = k
             ex, ey = self.roam_pos(0)
             x = lerp(self.start[0], ex, e)
             y = lerp(self.start[1], ey, e) + math.sin(k * math.pi * 3) * 45 * u * (1 - k)
             if k >= 1:
                 self.state, self.state_t = "idle", 0.0
         elif self.state == "idle":
-            self.roam_t += dt * self.speed
+            if not self.reduce_motion:
+                self.roam_t += dt * self.speed
             x, y = self.roam_pos(self.roam_t)
             if self.state_t > self.auto_hide:
                 self.leave("timeout")
@@ -1025,8 +1122,10 @@ class Scene:
             if self.state_t > self.CELEBRATE_DUR:
                 self._begin_exit()
         else:  # exit
-            k = clamp(self.state_t / self.EXIT_DUR, 0, 1)
+            k = clamp(self.state_t / self.exit_dur, 0, 1)
             e = ease_in_cubic(k)
+            if self.reduce_motion:
+                self.fade = 1 - k
             x = lerp(self.exit_from[0], self.exit_to[0], e)
             y = lerp(self.exit_from[1], self.exit_to[1], e) + math.sin(k * math.pi * 2) * 20 * u
             if k >= 1:
@@ -1068,12 +1167,12 @@ class Scene:
             self._wave_spawn += dt * 7 * self.wave_level
             while self._wave_spawn > 1:
                 self._wave_spawn -= 1
-                self.particles.append(Particle("bubble", random.uniform(0, self.W),
-                                               self.H - random.uniform(5, 40) * u, 0,
+                self.particles.append(Particle("bubble", random.uniform(0, self.fx_w),
+                                               self.fx_h - random.uniform(5, 40) * u, 0,
                                                -random.uniform(15, 35) * u, random.uniform(3, 8) * u,
                                                random.uniform(1.2, 2.4)))
         sp = math.hypot(*self.vel)
-        if sp > 30 * u and not self.compact:
+        if sp > 30 * u and not self.compact and not self.reduce_motion:
             self._trail_spawn += dt * min(18, sp / (14 * u))
             while self._trail_spawn > 1:
                 self._trail_spawn -= 1
@@ -1141,10 +1240,10 @@ class Scene:
     def draw_fx(self, p):
         """Wave + rising bubbles (bottom strip of the screen)."""
         self._draw_wave(p)
-        fx_rect = (0, self.H - self.fx_h, self.W, self.fx_h)
-        self._draw_particles(p, ("bubble",), fx_rect)
+        self._draw_particles(p, ("bubble",), (0, 0, self.fx_w, self.fx_h))
 
     def draw_mascot(self, p, clip_rect=None):
+        p.setOpacity(self.fade)
         if self.compact:
             p.fillRect(QRectF(0, 0, self.W, self.H),
                        lin(0, 0, 0, self.H, [(0, C(0.93, 0.97, 1.0)), (1, C(0.78, 0.89, 0.99))]))
@@ -1156,7 +1255,7 @@ class Scene:
     def _draw_wave(self, p):
         if not self.wave_h or self.wave_level < 0.01:
             return
-        W, H, t, u = self.W, self.H, self.t, self.u
+        W, H, t, u = self.fx_w, self.fx_h, self.t, self.u  # wave strip's own coordinates
         base = self.wave_h * ease_out_cubic(clamp(self.wave_level, 0, 1))
         for amp, freq, spd, lift, alpha in ((12 * u, 0.0060, 0.9, 18 * u, 0.30),
                                             (9 * u, 0.0085, -1.3, 0.0, 0.42)):
@@ -1372,7 +1471,7 @@ class Scene:
         sc = max(0.01, ease_out_back(vis) if self.state in ("idle", "celebrate") else vis)
 
         p.save()
-        p.setOpacity(clamp(vis * 1.5, 0, 1))
+        p.setOpacity(p.opacity() * clamp(vis * 1.5, 0, 1))
         p.translate(tail_x, tail_y)
         p.scale(sc, sc)
         p.translate(-tail_x, -tail_y)
@@ -1441,33 +1540,47 @@ class Scene:
         p.drawText(QRectF(bx + pad, yy, inner, sh + 4), int(Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop), sub)
         yy += sh + 14 * u
 
-        # progress: little glasses
+        # progress: little glasses (empty ones clearly outlined, full ones blue)
         gw, gh = 14 * u, 20 * u
-        n = min(self.goal, 12)
-        for i in range(n):
-            gx = bx + pad + i * (gw + 6 * u)
-            filled = i < self.count
-            gp = glass_path(gx, yy + 2 * u, gw, gh)
-            fill(p, gp, C(0.88, 0.94, 1.0))
-            if filled:
-                pop = 1.0
-                if self.state == "celebrate" and i == self.count - 1:
-                    pop = clamp(self.state_t / 0.6, 0, 1)
-                top = yy + 2 * u + gh * 0.22 + (1 - pop) * gh
-                p.save()
-                p.setClipPath(gp)
-                p.fillRect(QRectF(gx, top, gw, gh), lin(0, top, 0, yy + 2 * u + gh,
-                                                          [(0, C(0.45, 0.82, 1.0)), (1, C(0.12, 0.48, 0.95))]))
-                p.restore()
-            stroke(p, gp, C(0.30, 0.58, 0.92, 1 if filled else 0.55), 1.5 * u)
         vol = self.count * self.ml
         vol_s = f"{vol} ml" if vol < 1000 else f"{vol / 1000:.2f}".rstrip("0").rstrip(".") + " L"
         extra = f"  +{self.count - self.goal}" if self.count > self.goal else ""
+        label = f"{self.count}/{self.goal}{extra}  ·  {vol_s}"
         f_prog = make_font(12.5 * u, True)
+        label_w = QFontMetricsF(f_prog).horizontalAdvance(label)
+        step = gw + 6 * u
+        fit = max(1, int((inner - label_w - 10 * u + 6 * u) // step))
+        n = min(self.goal, fit)
+        # if the goal has more glasses than fit, each icon stands for a share of the goal
+        n_full = self.count if n == self.goal else int(round(min(self.count, self.goal) * n / self.goal))
+        for i in range(n):
+            gx = bx + pad + i * step
+            gy = yy + 2 * u
+            filled = i < n_full
+            gp = glass_path(gx, gy, gw, gh)
+            if filled:
+                fill(p, gp, C(0.86, 0.93, 1.0))
+                pop = 1.0
+                if self.state == "celebrate" and i == n_full - 1:
+                    pop = clamp(self.state_t / 0.6, 0, 1)
+                top = gy + gh * 0.22 + (1 - pop) * gh * 0.78
+                p.save()
+                p.setClipPath(gp)
+                p.fillRect(QRectF(gx, top, gw, gh), lin(0, top, 0, gy + gh,
+                                                          [(0, C(0.45, 0.82, 1.0)), (1, C(0.12, 0.48, 0.95))]))
+                p.restore()
+                stroke(p, gp, C(0.12, 0.45, 0.88), 1.6 * u)
+            else:
+                fill(p, gp, C(1, 1, 1))
+                stroke(p, gp, C(0.30, 0.54, 0.90), 1.7 * u)
+                # a faint empty "water line" so it reads as an empty glass
+                line = QPainterPath()
+                line.moveTo(gx + gw * 0.22, gy + gh * 0.72)
+                line.lineTo(gx + gw * 0.78, gy + gh * 0.72)
+                stroke(p, line, C(0.55, 0.74, 0.97), 1.3 * u)
         p.setFont(f_prog)
         p.setPen(C(0.18, 0.45, 0.82))
-        p.drawText(QRectF(bx + pad, yy + 2 * u, inner, gh), int(Qt.AlignRight | Qt.AlignVCenter),
-                   f"{self.count}/{self.goal}{extra}  ·  {vol_s}")
+        p.drawText(QRectF(bx + pad, yy + 2 * u, inner, gh), int(Qt.AlignRight | Qt.AlignVCenter), label)
         yy += 24 * u + 14 * u
 
         if btn_h:
@@ -1558,7 +1671,6 @@ class FxWindow(QWidget):
     def paintEvent(self, _ev):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.translate(0, -(self.scene.H - self.scene.fx_h))
         self.scene.draw_fx(p)
         p.end()
 
@@ -1576,11 +1688,17 @@ class Overlay:
         self.scene = Scene(self.avail.width(), self.avail.height(), cfg, count, user_first_name(cfg), compact,
                            intro=intro)
         self.fx = None
-        if not compact:
+        if not compact and self.scene.wave_h:
             self.fx = FxWindow(self)
-            self.fx.setGeometry(self.avail.x(), self.avail.y() + self.avail.height() - self.scene.fx_h,
-                                self.avail.width(), self.scene.fx_h)
+            # The wave hugs the real bottom edge of the screen (over the Dock/taskbar, click-through),
+            # so there's never a gap, wherever the Dock or taskbar is placed.
+            full = screen.geometry()
+            self.scene.fx_w = full.width()
+            self.fx.setGeometry(full.x(), full.y() + full.height() - self.scene.fx_h,
+                                full.width(), self.scene.fx_h)
             self.fx.show()
+            if IS_MAC:
+                mac_overlay_window(self.fx)
         self.mascot = MascotWindow(self)
         if compact:
             self.mascot.move(self.avail.right() - self.scene.win_w - 16,
@@ -1589,6 +1707,8 @@ class Overlay:
             self._place()
         self.mascot.show()
         self.mascot.raise_()
+        if IS_MAC:
+            mac_overlay_window(self.mascot)
         self._cursor_hand = False
         self._frame = 0
         self._fx_acc = 0.0
@@ -1959,9 +2079,26 @@ def _card(parent_layout, title):
 
 
 def _bring_to_front(w):
+    if IS_MAC:
+        mac_activate()  # menu-bar apps must activate first or the window opens behind others
+    w.setWindowState((w.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
     w.show()
     w.raise_()
     w.activateWindow()
+
+
+def _alive(w):
+    """True if a Qt widget still exists (closed dialogs are deleted by Qt)."""
+    if w is None:
+        return False
+    try:
+        from shiboken6 import isValid
+        if not isValid(w):
+            return False
+        w.isVisible()
+        return True
+    except (RuntimeError, ImportError):
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -2034,6 +2171,9 @@ class SettingsDialog(QDialog):
         f.addRow(label("Remind me every"), stepper(self.interval))
         f.addRow(label("Snooze for"), stepper(self.snooze))
         f.addRow(label("Hide if ignored after"), stepper(self.autohide))
+        self.pacing = QCheckBox("Adapt to my pace (a bit sooner when I'm behind,\nless often once I reach my goal)")
+        self.pacing.setChecked(bool(cfg.get("smart_pacing", True)))
+        f.addRow(self.pacing)
 
         f, outer = _card(left, "Daily goal")
         self.goal = spin(1, 24, 1, " glasses", cfg["daily_goal_glasses"])
@@ -2093,10 +2233,13 @@ class SettingsDialog(QDialog):
         self.login = QCheckBox("Start automatically when I log in")
         self._login_was = autostart_is_enabled()
         self.login.setChecked(self._login_was)
+        self.motion = QCheckBox("Reduce motion (no roaming or wave)")
+        self.motion.setChecked(bool(cfg.get("reduce_motion", False)))
         self.updates = QCheckBox("Check for updates automatically")
         self.updates.setChecked(bool(cfg.get("check_updates", True)))
         f.addRow(label("Your name"), self.name)
         f.addRow(srow)
+        f.addRow(self.motion)
         f.addRow(self.login)
         f.addRow(self.updates)
         right.addStretch(1)
@@ -2162,6 +2305,8 @@ class SettingsDialog(QDialog):
         self.sound.setChecked(d["sound"])
         self.login.setChecked(True)
         self.updates.setChecked(True)
+        self.pacing.setChecked(d["smart_pacing"])
+        self.motion.setChecked(d["reduce_motion"])
 
     def values(self):
         cfg = load_config()  # keep any keys we don't show here
@@ -2180,6 +2325,8 @@ class SettingsDialog(QDialog):
             "sound": self.sound.isChecked(),
             "name": self.name.text().strip(),
             "check_updates": self.updates.isChecked(),
+            "smart_pacing": self.pacing.isChecked(),
+            "reduce_motion": self.motion.isChecked(),
         })
         return cfg
 
@@ -2261,6 +2408,23 @@ def compute_stats(st=None, goal=None):
         "overachiever": any(v >= goal + 2 for v in hist.values()),
         "hist": hist,
     }
+
+
+def export_csv(path):
+    """Write the full history as CSV; returns the number of days written."""
+    import csv
+    cfg, st = load_config(), load_state()
+    goal, ml = max(1, int(cfg["daily_goal_glasses"])), int(cfg["glass_ml"])
+    hist = dict(st.get("history", {}))
+    hist[st["date"]] = st["count"]
+    times = st.get("times", {})
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["date", "glasses", "ml", "goal", "goal_met", "times"])
+        for day in sorted(hist):
+            c = hist[day]
+            w.writerow([day, c, c * ml, goal, "yes" if c >= goal else "no", " ".join(times.get(day, []))])
+    return len(hist)
 
 
 class BarChart(QWidget):
@@ -2472,8 +2636,11 @@ class StatsDialog(QDialog):
         self.undo_btn.clicked.connect(self._undo)
         log = QPushButton("+ Log a glass")
         log.clicked.connect(self._log)
+        export = QPushButton("Export CSV…")
+        export.clicked.connect(self._export)
         btns.addWidget(self.undo_btn)
         btns.addWidget(log)
+        btns.addWidget(export)
         btns.addStretch(1)
         close = QPushButton("Close", objectName="primary")
         close.clicked.connect(self.accept)
@@ -2511,12 +2678,21 @@ class StatsDialog(QDialog):
         (self.on_undo or undo_glass)()
         self.refresh()
 
+    def _export(self):
+        from PySide6.QtWidgets import QFileDialog
+        default = os.path.join(os.path.expanduser("~"), f"water-history-{datetime.date.today().isoformat()}.csv")
+        path, _ = QFileDialog.getSaveFileName(self, "Export history", default, "CSV files (*.csv)")
+        if path:
+            n = export_csv(path)
+            QMessageBox.information(self, APP_NAME, f"Saved {n} days of history to\n{path}")
+
 
 # --------------------------------------------------------------------------- #
 # Updates: check GitHub Releases, download, verify (SHA-256), replace, restart
 # --------------------------------------------------------------------------- #
 UPDATE_FILE = os.path.join(DATA_DIR, "update.json")
-UPDATE_DIR = os.path.join(DATA_DIR, "update")
+# Windows: keep big downloads out of the roaming profile (%LOCALAPPDATA%, next to the app)
+UPDATE_DIR = os.path.join(os.path.dirname(APP_DIR) if IS_WIN else DATA_DIR, "update")
 
 
 def _version_tuple(v):
@@ -2543,7 +2719,7 @@ def update_asset_name():
     if not IS_FROZEN:
         return "water_reminder.py"
     if IS_WIN:
-        return "WaterReminder-Windows.exe"
+        return "WaterReminder-Windows.zip"
     if IS_MAC:
         return "WaterReminder-macOS.dmg"
     return f"WaterReminder-Linux-{platform.machine()}"
@@ -2627,6 +2803,19 @@ def _sha256(path):
     return h.hexdigest()
 
 
+def verify_download(sums_path, name, path):
+    """True if `path` matches the SHA-256 listed for `name` in a SHA256SUMS.txt file."""
+    try:
+        with open(sums_path, encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[1].lstrip("*") == name:
+                    return parts[0].lower() == _sha256(path)
+    except OSError:
+        pass
+    return False
+
+
 def apply_update(path, app):
     """Install the downloaded file and restart. Returns an error string, or None (app is quitting)."""
     if not IS_FROZEN:
@@ -2653,8 +2842,10 @@ def apply_update(path, app):
 # Water Reminder self-update: swap in the new .app once the old one has quit.
 while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.3; done
 mkdir -p "{mnt}"
+hdiutil detach "{mnt}" -force -quiet 2>/dev/null
 hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "{mnt}" "{path}" || {{ open "{path}"; exit 1; }}
-NEW=$(ls -d "{mnt}"/*.app | head -1)
+NEW=$(ls -d "{mnt}"/*.app 2>/dev/null | head -1)
+[ -d "$NEW" ] || {{ hdiutil detach "{mnt}" -quiet; open "{path}"; exit 1; }}
 rm -rf "{bundle}.old"
 if mv "{bundle}" "{bundle}.old" && ditto "$NEW" "{bundle}"; then
   rm -rf "{bundle}.old"
@@ -2667,10 +2858,20 @@ open "{bundle}" --args --after-update
 """)
         os.chmod(script, 0o755)
         spawn_detached(["/bin/bash", script])
+    elif IS_WIN:
+        # unpack the new version next to the download; it installs itself (see frozen_first_run)
+        import zipfile
+        new_dir = os.path.join(UPDATE_DIR, "new")
+        shutil.rmtree(new_dir, ignore_errors=True)
+        with zipfile.ZipFile(path) as z:
+            z.extractall(new_dir)
+        exe = os.path.join(new_dir, "WaterReminder", "WaterReminder.exe")
+        if not os.path.exists(exe):
+            return "The downloaded update didn't contain WaterReminder.exe."
+        spawn_detached([exe, "--after-update"])
     else:
-        # Windows .exe / Linux binary: the new file installs itself (see frozen_first_run)
-        if not IS_WIN:
-            os.chmod(path, 0o755)
+        # Linux binary: the new file installs itself (see frozen_first_run)
+        os.chmod(path, 0o755)
         spawn_detached([path, "--after-update"])
     QTimer.singleShot(300, app.quit)
     return None
@@ -2759,18 +2960,8 @@ class UpdateDialog(QDialog):
             if err:
                 self._fail(f"Download failed: {err}")
                 return
-            try:
-                expected = {}
-                with open(sums, encoding="utf-8") as f:
-                    for line in f:
-                        parts = line.split()
-                        if len(parts) == 2:
-                            expected[parts[1].lstrip("*")] = parts[0].lower()
-                if expected.get(name) != _sha256(target):
-                    self._fail("The download didn't match its checksum, so it wasn't installed. Please try again.")
-                    return
-            except OSError as e:
-                self._fail(f"Couldn't verify the download ({e}).")
+            if not verify_download(sums, name, target):
+                self._fail("The download didn't match its checksum, so it wasn't installed. Please try again.")
                 return
             self.status.setText("Installing… Water Reminder will restart in a moment.")
             self.bar.setRange(0, 0)
@@ -2879,7 +3070,7 @@ class Service:
             self.schedule(1)
         else:
             rem = self.frozen_remaining
-            self.schedule(rem / 60 if rem and rem > 0 else 0.5 if rem is not None else cfg["interval_minutes"])
+            self.schedule(rem / 60 if rem and rem > 0 else 0.5 if rem is not None else next_interval(cfg))
         self.frozen_remaining = None
 
     def _try_show(self, cfg=None, force=False):
@@ -2921,12 +3112,12 @@ class Service:
         if self.once:
             QTimer.singleShot(100, self.app.quit)
             return
-        self.schedule(cfg["snooze_minutes"] if result == "snooze" else cfg["interval_minutes"])
+        self.schedule(cfg["snooze_minutes"] if result == "snooze" else next_interval(cfg))
 
     def log_glass(self):
         record_glass()
         self._refresh_tray()
-        if self.stats_dlg is not None and self.stats_dlg.isVisible():
+        if _alive(self.stats_dlg) and self.stats_dlg.isVisible():
             self.stats_dlg.refresh()
 
     def undo_glass(self):
@@ -2986,33 +3177,36 @@ class Service:
         self.updater.check(done)
 
     def show_update(self, info):
-        if self.update_dlg is not None and self.update_dlg.isVisible():
+        if _alive(self.update_dlg) and self.update_dlg.isVisible():
             _bring_to_front(self.update_dlg)
             return
         self.update_dlg = UpdateDialog(self.updater, info, self.app)
+        self.update_dlg.destroyed.connect(lambda *_: setattr(self, "update_dlg", None))
         _bring_to_front(self.update_dlg)
 
     # -- windows ---------------------------------------------------------------
     def open_settings(self):
-        if self.settings_dlg is not None and self.settings_dlg.isVisible():
+        if _alive(self.settings_dlg) and self.settings_dlg.isVisible():
             _bring_to_front(self.settings_dlg)
             return
         self.settings_dlg = SettingsDialog(on_saved=self._settings_saved, on_preview=lambda: self._try_show(force=True),
                                            on_stats=self.open_stats, on_quit=self.app.quit,
                                            on_check_updates=self.check_updates_now)
+        self.settings_dlg.destroyed.connect(lambda *_: setattr(self, "settings_dlg", None))
         _bring_to_front(self.settings_dlg)
 
     def open_stats(self):
-        if self.stats_dlg is not None and self.stats_dlg.isVisible():
+        if _alive(self.stats_dlg) and self.stats_dlg.isVisible():
             self.stats_dlg.refresh()
             _bring_to_front(self.stats_dlg)
             return
         self.stats_dlg = StatsDialog(on_log=self.log_glass, on_undo=self.undo_glass)
+        self.stats_dlg.destroyed.connect(lambda *_: setattr(self, "stats_dlg", None))
         _bring_to_front(self.stats_dlg)
 
     def _settings_saved(self, cfg):
         if self.overlay is None and not self.paused_until and not self.once:
-            self.schedule(cfg["interval_minutes"])
+            self.schedule(next_interval(cfg))
         self._refresh_tray()
 
     # -- tray --------------------------------------------------------------------
@@ -3197,41 +3391,79 @@ def frozen_first_run(after_update=False):
             return "welcome"
         return False
 
-    exe = os.path.abspath(sys.executable)
+    exe = os.path.realpath(sys.executable)
+    # Windows ships as a folder (WaterReminder.exe + _internal); Linux as one file.
     target = os.path.join(APP_DIR, "WaterReminder.exe" if IS_WIN else "WaterReminder")
-    if os.path.normcase(exe) == os.path.normcase(os.path.abspath(target)):
-        return False  # already running the installed copy
-    # A fresh download (or an update): replace the installed copy and start it.
-    if send_command("quit"):
-        time.sleep(1.5)
-    os.makedirs(APP_DIR, exist_ok=True)
-    for _ in range(20):
+    src_dir = os.path.dirname(exe)
+    app_dir = os.path.realpath(APP_DIR)
+
+    def same_path(a, b):
         try:
-            shutil.copy2(exe, target)
-            break
+            return os.path.samefile(a, b)
         except OSError:
-            time.sleep(0.5)
-    else:
-        return False  # couldn't copy: just run from here
-    if not IS_WIN:
-        os.chmod(target, 0o755)
+            return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+    if (IS_WIN and os.path.isdir(app_dir) and same_path(src_dir, app_dir)) or \
+            (not IS_WIN and os.path.exists(target) and same_path(exe, target)):
+        return False  # already running the installed copy
+    if IS_WIN and os.path.normcase(exe).startswith(os.path.normcase(app_dir) + os.sep):
+        return False  # never replace the folder we are running from
+    # A fresh download, or an update: replace the installed copy and start it.
+    was_installed = os.path.exists(target) or bool(cfg.get("autostart_configured"))
+    for _ in range(8):  # ask any running copy to quit, and wait until it has
+        if not send_command("quit", timeout=400):
+            break
+        time.sleep(0.5)
     if IS_LINUX:
         _stop_old_linux_daemon()
+    ok = False
+    if IS_WIN:
+        # copy beside, then swap folders: a failure never leaves a half-deleted install
+        new_dir, old_dir = app_dir + ".new", app_dir + ".old"
+        shutil.rmtree(new_dir, ignore_errors=True)
+        try:
+            shutil.copytree(src_dir, new_dir)
+        except OSError as e:
+            print(f"[{APP_ID}] copy failed: {e}", file=sys.stderr)
+            return "failed"
+        for _ in range(40):  # Windows keeps files locked for a moment after a process exits
+            try:
+                shutil.rmtree(old_dir, ignore_errors=True)
+                if os.path.isdir(app_dir):
+                    os.rename(app_dir, old_dir)
+                os.rename(new_dir, app_dir)
+                ok = True
+                break
+            except OSError:
+                time.sleep(0.5)
+        shutil.rmtree(old_dir, ignore_errors=True)
+    else:
+        try:
+            os.makedirs(APP_DIR, exist_ok=True)
+            tmp = target + ".new"
+            shutil.copy2(exe, tmp)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, target)
+            ok = True
+        except OSError as e:
+            print(f"[{APP_ID}] copy failed: {e}", file=sys.stderr)
+    if not ok:
+        print(f"[{APP_ID}] couldn't install into {APP_DIR}", file=sys.stderr)
+        return "failed"
     if not cfg.get("autostart_configured") or autostart_is_enabled():
         autostart_enable([target])
     create_shortcuts([target])
     cfg["autostart_configured"] = True
     save_config(cfg)
-    spawn_detached([target, "--after-update" if after_update else "--welcome"])
+    spawn_detached([target, "--after-update" if (after_update or was_installed) else "--welcome"])
     return True
 
 
 def do_uninstall(purge=False, quiet=False):
     send_command("quit")
+    if IS_MAC:
+        _run(["launchctl", "unload", MAC_PLIST])  # before the plist is deleted
     autostart_disable()
     remove_shortcuts()
-    if IS_MAC:
-        _run(["launchctl", "unload", MAC_PLIST])
     if IS_LINUX:
         _stop_old_linux_daemon()
     if IS_FROZEN and IS_WIN:
@@ -3241,10 +3473,15 @@ def do_uninstall(purge=False, quiet=False):
                          creationflags=0x08000000, close_fds=True, cwd=os.path.dirname(APP_DIR))
     else:
         shutil.rmtree(APP_DIR, ignore_errors=True)
+    shutil.rmtree(UPDATE_DIR, ignore_errors=True)
     if purge:
+        log = sys.stdout
+        if getattr(log, "name", "") == LOG_FILE:  # windowed builds log to a file inside DATA_DIR
+            sys.stdout = sys.stderr = None
+            log.close()
         shutil.rmtree(DATA_DIR, ignore_errors=True)
         shutil.rmtree(CONFIG_DIR, ignore_errors=True)
-    if not quiet:
+    if not quiet and sys.stdout:
         print("Water Reminder removed." + ("" if purge else " (Your history and settings were kept.)"))
     return 0
 
@@ -3281,6 +3518,7 @@ def main():
     ap.add_argument("--welcome", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--after-update", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--check-updates", action="store_true", help="check for a new version")
+    ap.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
     args, _unknown = ap.parse_known_args()  # tolerate extra args (e.g. macOS -psn_...)
 
     if args.status:
@@ -3325,6 +3563,24 @@ def main():
         upd.check(checked)
         return app.exec()
 
+    if args.selftest:  # used by the build: proves Qt GUI, fonts and drawing work in the packaged app
+        from PySide6.QtGui import QImage
+        scene = Scene(1280, 800, dict(DEFAULTS), 2, "Test")
+        img = QImage(1280, 800, QImage.Format_ARGB32_Premultiplied)
+        for i in range(240):
+            scene.update(1 / 30)
+            if i % 60 == 0:
+                img.fill(0)
+                p = QPainter(img)
+                scene.draw_fx(p)
+                scene.draw_mascot(p)
+                p.end()
+        SettingsDialog().close()
+        StatsDialog().close()
+        render_app_icon(64)
+        print("selftest ok", flush=True)
+        return 0
+
     for flag, cmd, dialog in ((args.settings, "settings", "settings"), (args.stats, "stats", "stats")):
         if not flag:
             continue
@@ -3362,6 +3618,11 @@ def main():
         r = frozen_first_run(after_update=args.after_update)
         if r is True:
             return 0
+        if r == "failed":
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(None, APP_NAME, "Water Reminder couldn't be installed into\n"
+                                f"{APP_DIR}\n\nPlease close any running copy and try again.")
+            return 1
         welcome = welcome or r == "welcome"
 
     if send_command("ping"):
@@ -3374,9 +3635,10 @@ def main():
     cfg = load_config()
     print(f"[{APP_ID}] v{APP_VERSION} running - every {cfg['interval_minutes']} min "
           f"(quiet {cfg['quiet_hours']['start']}-{cfg['quiet_hours']['end']})", flush=True)
-    svc.schedule(cfg["interval_minutes"])
+    svc.schedule(next_interval(cfg))
     if args.after_update:
         print(f"[{APP_ID}] updated to v{APP_VERSION}", flush=True)
+        QTimer.singleShot(15000, lambda: shutil.rmtree(UPDATE_DIR, ignore_errors=True))
         _update_state(skipped=None, prompted=None)
 
         def greet():
@@ -3396,4 +3658,12 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    # Exit right away: skipping interpreter teardown avoids rare crashes when Python and Qt
+    # free their objects in the wrong order (seen with PySide6 in packaged builds).
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream and stream.flush()
+        except Exception:
+            pass
+    os._exit(code or 0)

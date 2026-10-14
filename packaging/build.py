@@ -6,7 +6,7 @@ Build the one-click app for the current OS with PyInstaller.
     python packaging/build.py
 
 Output (in dist/release/):
-    Windows  ->  WaterReminder-Windows.exe
+    Windows  ->  WaterReminder-Windows.zip      (folder with WaterReminder.exe)
     macOS    ->  WaterReminder-macOS.dmg      (contains "Water Reminder.app")
     Linux    ->  WaterReminder-Linux-x86_64
 
@@ -56,9 +56,40 @@ def make_icons(w):
 def pyinstaller(extra):
     cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed",
            "--name", "WaterReminder", "--distpath", str(DIST), "--workpath", str(BUILD / "pyi"),
-           "--specpath", str(BUILD), "--exclude-module", "tkinter", *extra, str(ROOT / "water_reminder.py")]
+           "--specpath", str(BUILD), "--noupx", "--exclude-module", "tkinter", *extra, str(ROOT / "water_reminder.py")]
     print("+", " ".join(cmd), flush=True)
     subprocess.run(cmd, check=True, cwd=ROOT)
+
+
+def windows_version_file(version):
+    import re
+    nums = tuple(int(x) for x in (re.findall(r"\d+", version) + ["0", "0", "0", "0"])[:4])
+    path = BUILD / "version.txt"
+    path.write_text(f"""VSVersionInfo(
+  ffi=FixedFileInfo(filevers={nums}, prodvers={nums}, mask=0x3f, flags=0x0, OS=0x40004,
+                    fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[StringFileInfo([StringTable('040904B0', [
+          StringStruct('CompanyName', 'Water Reminder (open source)'),
+          StringStruct('FileDescription', 'Water Reminder'),
+          StringStruct('FileVersion', '{version}'),
+          StringStruct('InternalName', 'WaterReminder'),
+          StringStruct('LegalCopyright', 'MIT License'),
+          StringStruct('OriginalFilename', 'WaterReminder.exe'),
+          StringStruct('ProductName', 'Water Reminder'),
+          StringStruct('ProductVersion', '{version}')])]),
+        VarFileInfo([VarStruct('Translation', [1033, 1200])])])
+""")
+    return path
+
+
+def smoke_test(exe):
+    """Run the packaged app once (--status) to prove it starts on this OS."""
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    for flag in ("--status", "--selftest"):
+        r = subprocess.run([str(exe), flag], env=env, timeout=180)
+        if r.returncode != 0:
+            sys.exit(f"Smoke test failed: {exe} {flag} exited with {r.returncode}")
+        print(f"Smoke test passed: {exe.name} {flag}", flush=True)
 
 
 def main():
@@ -69,8 +100,11 @@ def main():
     REL.mkdir(parents=True)
 
     if SYSTEM == "Windows":
-        pyinstaller(["--onefile", "--icon", str(BUILD / "icon.ico")])
-        shutil.move(str(DIST / "WaterReminder.exe"), REL / "WaterReminder-Windows.exe")
+        # A folder build (not --onefile): far fewer antivirus false positives, faster start.
+        pyinstaller(["--onedir", "--icon", str(BUILD / "icon.ico"),
+                     "--version-file", str(windows_version_file(version))])
+        smoke_test(DIST / "WaterReminder" / "WaterReminder.exe")
+        shutil.make_archive(str(REL / "WaterReminder-Windows"), "zip", root_dir=DIST, base_dir="WaterReminder")
 
     elif SYSTEM == "Darwin":
         pyinstaller(["--icon", str(BUILD / "icon.icns"), "--osx-bundle-identifier", "com.waterreminder.app"])
@@ -93,6 +127,7 @@ def main():
             plistlib.dump(pl, f)
         # re-sign (ad-hoc) after editing Info.plist, otherwise Apple Silicon refuses to run it
         subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(app)], check=True)
+        smoke_test(app / "Contents" / "MacOS" / "WaterReminder")
         stage = BUILD / "dmg"
         shutil.rmtree(stage, ignore_errors=True)
         stage.mkdir(parents=True)
@@ -112,6 +147,7 @@ def main():
         out = REL / f"WaterReminder-Linux-{platform.machine()}"
         shutil.move(str(DIST / "WaterReminder"), out)
         out.chmod(0o755)
+        smoke_test(out)
 
     print("\nBuilt:", *[p.name for p in REL.iterdir()], sep="\n  ")
 

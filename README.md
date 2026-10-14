@@ -13,47 +13,47 @@ An animated hydration buddy for **Windows, macOS and Linux**. Every 30 minutes, 
 - 🥤 A daily goal tracker, a celebration each time you log a glass, and undo if you clicked by mistake
 - ⚙️ A **Settings window** for the interval, goal, glass size, quiet hours, focus/away behaviour, name, sound and start-at-login
 - 🧭 A system tray / menu bar icon with Remind me now, Log a glass, History & stats, Pause and Settings
-- 🔄 **Automatic updates.** It checks for a new version once a day, shows you what's new, and updates itself with one click. Every download is checked against its SHA-256 checksum before it's installed.
+- 🔄 **Easy updates.** It checks once a day, or you can run the one-line install command again. Every download is checked against its SHA-256 checksum.
+- 🧘 **Smart pacing and reduce motion.** It reminds you a bit sooner when you're behind your goal and less often once you've reached it. A calmer mode drops the roaming and the wave.
+- 📤 **Export your history** to CSV from the stats window.
 - 🪶 Low CPU use: it only animates while the reminder is on screen, and lowers its frame rate while the mascot moves slowly
 
 | Settings | History & stats |
 |---|---|
 | ![Settings](docs/settings.png) | ![Stats](docs/stats.png) |
 
-## Download (easiest)
+## Install or update — one command
 
-Get the file for your system from the **[latest release](https://github.com/mhd-mansoor/water-reminder/releases/latest)**. You don't need Python.
+**Windows** — open **PowerShell** (Start menu → type *PowerShell*) and paste:
+```powershell
+irm https://raw.githubusercontent.com/mhd-mansoor/water-reminder/main/install.ps1 | iex
+```
 
-| System | File | First launch |
-|---|---|---|
-| **Windows 10/11** | `WaterReminder-Windows.exe` | Double-click it. If Windows shows *"Windows protected your PC"*, click **More info → Run anyway**. |
-| **macOS 12+** (Apple Silicon) | `WaterReminder-macOS.dmg` | Open the .dmg and drag **Water Reminder** to **Applications**. The first time, **right-click the app → Open → Open**. |
-| **Linux** (x86-64) | `WaterReminder-Linux-x86_64` | `chmod +x WaterReminder-Linux-x86_64 && ./WaterReminder-Linux-x86_64` |
+**macOS / Linux** — open **Terminal** and paste:
+```bash
+curl -fsSL https://raw.githubusercontent.com/mhd-mansoor/water-reminder/main/install.sh | bash
+```
 
-The first time it runs, it installs itself for your user, turns on start-at-login and says hello.
+**Updating uses the same command.** It downloads the newest version, checks its SHA-256 checksum, installs it for your user only (no admin rights needed), turns on start-at-login and restarts the app. Your history and settings are kept. This also works if you installed an older version in any other way.
 
-## Updates
+It also updates itself. Once a day it checks for a new version and shows you what's new, with **Update now**, **Later** and **Skip this version**. To check right away, choose *Check for updates…* in the tray menu or *Settings → Check for updates*.
 
-From version 1.3.0 on, Water Reminder updates itself:
+| System | What you get |
+|---|---|
+| Windows 10/11 | The app, in `%LOCALAPPDATA%\WaterReminder` |
+| macOS 12+ on Apple Silicon | `Water Reminder.app` in Applications |
+| Linux x86-64 | The app, in `~/.local/share/water-reminder` |
+| Intel Macs, ARM Linux | A Python-based install (it needs Python 3.9+) |
 
-- **Once a day**, it checks this repository's latest release. When there's a newer version, a window shows what's new, with **Update now**, **Later** and **Skip this version**. It never interrupts a full-screen app or a call to ask.
-- **Update now** downloads the right file for your system, checks its SHA-256 checksum, swaps it in and restarts. Your history and settings are kept.
-- **To check right away**, choose *Check for updates…* in the tray menu, use *Settings → Check for updates*, or run `water-reminder --check-updates`.
-- **To turn off the daily check**, untick *Settings → Check for updates automatically*.
+### Prefer to download a file?
 
-**Using an older version** (installed before 1.3.0)? Update once by hand, and it updates itself from then on:
+Get it from the **[latest release](https://github.com/mhd-mansoor/water-reminder/releases/latest)**:
 
-- **Downloaded app:** download the new file and open it. It replaces the old one.
-- **Installed from source:** `git pull`, then run `bash install.sh` (or `install.bat`) again.
+- **Windows:** download `WaterReminder-Windows.zip`, then **extract it** (right-click → *Extract All*) and open `WaterReminder.exe`. If Windows shows *"Windows protected your PC"*, click **More info → Run anyway**.
+- **macOS:** open `WaterReminder-macOS.dmg` and drag the app to Applications. The first time, right-click it → **Open**.
+- **Linux:** `chmod +x WaterReminder-Linux-x86_64 && ./WaterReminder-Linux-x86_64`
 
-> The apps aren't code-signed (signing costs money), which is why Windows and macOS warn you the first time.
-
-## Install from source (alternative)
-
-You need Python 3.9 or newer. Download the project (**Code → Download ZIP**, or `git clone https://github.com/mhd-mansoor/water-reminder.git`), then:
-
-- **Windows:** double-click `install.bat`
-- **macOS / Linux:** `bash install.sh`
+> These warnings appear because the app isn't code-signed (signing certificates cost money). The one-command install avoids them. The code is open, and every release is built on GitHub's servers from this repository.
 
 ## Using it
 
@@ -81,7 +81,9 @@ You need Python 3.9 or newer. Download the project (**Code → Download ZIP**, o
 | Quiet hours | 22:00 – 08:00 |
 | Don't interrupt full-screen apps, presentations, calls, Do Not Disturb | on |
 | Pause while I'm away (no input for…) | on, 5 min |
-| Your name, sound, start at login | login name, on, on |
+| Adapt to my pace (smart pacing) | on |
+| Your name, sound, reduce motion | login name, on, off |
+| Start at login, check for updates | on, on |
 
 Changes apply right away. They're saved in `config.json`:
 `%APPDATA%\WaterReminder\` (Windows), `~/Library/Application Support/WaterReminder/` (macOS), `~/.config/water-reminder/` (Linux).
@@ -99,24 +101,28 @@ If something can't be detected on your system, reminders work normally.
 ## Uninstall
 
 Open **Settings → Uninstall…**. On macOS, also drag the app from Applications to the Trash.
-If you installed from source, you can instead run `uninstall.bat` or `bash uninstall.sh`. Add `--purge` to also delete your history.
+Or run `uninstall.bat` (Windows) or `bash uninstall.sh` (macOS/Linux) from this repository. Add `--purge` to also delete your history.
 
 ## For maintainers: publishing a release
 
 The workflow in `.github/workflows/release.yml` builds all three apps on GitHub's machines whenever you push. To publish a version:
 
-1. Raise `APP_VERSION` in `water_reminder.py`, for example to `1.3.1`.
+1. Raise `APP_VERSION` in `water_reminder.py`, for example to `1.4.1`.
 2. Commit and push.
 3. Tag the commit with the same number and push the tag:
 
    ```bash
-   git tag v1.3.1
-   git push origin v1.3.1
+   git tag v1.4.1
+   git push origin v1.4.1
    ```
 
 The tag must match `APP_VERSION`, or the release step stops.
 
-After about 10 minutes, the Releases page has the three apps, plus `water_reminder.py` (for source installs) and `SHA256SUMS.txt`. Everyone with version 1.3.0 or newer is offered the update within a day. The text you write in the release description is what they see under "What's new".
+GitHub then runs the tests on Windows, macOS and Linux, builds the three apps and starts each one once as a smoke test. If everything passes, it publishes the release after about 10 minutes, with the apps, `water_reminder.py` and `SHA256SUMS.txt`.
+
+Everyone with version 1.3.0 or newer is offered the update within a day. Anyone can also update straight away with the one-line install command. The text you write in the release description is what users see under "What's new".
+
+Run the tests locally with `python -m pytest -q tests`.
 
 You can build locally with `python packaging/build.py`.
 
