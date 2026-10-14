@@ -21,9 +21,11 @@ Requires Python 3.9+ and PySide6 (pip install PySide6-Essentials).
 import argparse
 import datetime
 import getpass
+import hashlib
 import json
 import math
 import os
+import platform
 import random
 import re
 import shutil
@@ -36,7 +38,8 @@ import wave
 from functools import lru_cache
 
 APP_NAME = "Water Reminder"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
+UPDATE_REPO = "mhd-mansoor/water-reminder"  # GitHub "owner/repo" that publishes releases
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 APP_ID = "water-reminder"
 IS_WIN = sys.platform.startswith("win")
@@ -49,13 +52,14 @@ if IS_LINUX and os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY") 
     os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 try:
-    from PySide6.QtCore import QCoreApplication, QElapsedTimer, QPointF, QRectF, Qt, QTime, QTimer
-    from PySide6.QtGui import (QAction, QColor, QCursor, QFont, QFontMetricsF,
+    from PySide6.QtCore import QCoreApplication, QElapsedTimer, QPointF, QRectF, Qt, QTime, QTimer, QUrl
+    from PySide6.QtGui import (QAction, QColor, QCursor, QDesktopServices, QFont, QFontMetricsF,
                                QGuiApplication, QIcon, QLinearGradient, QPainter, QPainterPath,
                                QPen, QPixmap, QPolygonF, QRadialGradient)
-    from PySide6.QtNetwork import QLocalServer, QLocalSocket
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket, QNetworkAccessManager, QNetworkReply, QNetworkRequest
     from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout,
-                                   QLabel, QLineEdit, QMenu, QPushButton, QSpinBox, QSystemTrayIcon,
+                                   QLabel, QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton,
+                                   QSpinBox, QSystemTrayIcon, QTextBrowser,
                                    QTimeEdit, QVBoxLayout, QWidget)
 except ImportError:
     print("PySide6 is not installed. Run:  python3 -m pip install PySide6-Essentials", file=sys.stderr)
@@ -99,6 +103,7 @@ DEFAULTS = {
     "respect_focus": True,      # don't interrupt full-screen apps, presentations, calls, DND
     "pause_when_away": True,    # freeze the countdown while you're away from the computer
     "away_minutes": 5,
+    "check_updates": True,      # look for a new version once a day
 }
 
 TIPS = [
@@ -886,6 +891,9 @@ class Scene:
             return "Daily goal reached!", "You're a hydration hero today. Keep sipping!"
         if self.intro == "welcome":
             return f"Welcome back, {self.name}!", "Good to see you again. Start with a fresh glass of water."
+        if self.intro == "updated":
+            return (f"I'm all updated, {self.name}!",
+                    f"Now on version {APP_VERSION}. Same friendly reminders, new tricks.")
         if self.intro == "hello":
             mins = int(self.cfg.get("interval_minutes", 30))
             return (f"Hi {self.name}, I'm your water buddy!",
@@ -1962,7 +1970,7 @@ def _bring_to_front(w):
 class SettingsDialog(QDialog):
     """A friendly settings window; writes config.json and tells the service."""
 
-    def __init__(self, on_saved=None, on_preview=None, on_stats=None, on_quit=None):
+    def __init__(self, on_saved=None, on_preview=None, on_stats=None, on_quit=None, on_check_updates=None):
         super().__init__(None, Qt.Dialog | Qt.WindowStaysOnTopHint | Qt.WindowCloseButtonHint)
         self.on_saved = on_saved
         self.on_quit = on_quit
@@ -2085,9 +2093,12 @@ class SettingsDialog(QDialog):
         self.login = QCheckBox("Start automatically when I log in")
         self._login_was = autostart_is_enabled()
         self.login.setChecked(self._login_was)
+        self.updates = QCheckBox("Check for updates automatically")
+        self.updates.setChecked(bool(cfg.get("check_updates", True)))
         f.addRow(label("Your name"), self.name)
         f.addRow(srow)
         f.addRow(self.login)
+        f.addRow(self.updates)
         right.addStretch(1)
 
         # --- footer
@@ -2101,6 +2112,10 @@ class SettingsDialog(QDialog):
             btns.addWidget(unin)
         ver = QLabel(f"v{APP_VERSION}", objectName="hint")
         btns.addWidget(ver)
+        if on_check_updates:
+            upd = QPushButton("Check for updates", objectName="flat")
+            upd.clicked.connect(on_check_updates)
+            btns.addWidget(upd)
         btns.addStretch(1)
         if on_stats:
             st = QPushButton("History && stats")
@@ -2146,6 +2161,7 @@ class SettingsDialog(QDialog):
         self.name.setText("")
         self.sound.setChecked(d["sound"])
         self.login.setChecked(True)
+        self.updates.setChecked(True)
 
     def values(self):
         cfg = load_config()  # keep any keys we don't show here
@@ -2163,6 +2179,7 @@ class SettingsDialog(QDialog):
             "away_minutes": self.away_min.value(),
             "sound": self.sound.isChecked(),
             "name": self.name.text().strip(),
+            "check_updates": self.updates.isChecked(),
         })
         return cfg
 
@@ -2496,6 +2513,284 @@ class StatsDialog(QDialog):
 
 
 # --------------------------------------------------------------------------- #
+# Updates: check GitHub Releases, download, verify (SHA-256), replace, restart
+# --------------------------------------------------------------------------- #
+UPDATE_FILE = os.path.join(DATA_DIR, "update.json")
+UPDATE_DIR = os.path.join(DATA_DIR, "update")
+
+
+def _version_tuple(v):
+    nums = re.findall(r"\d+", v or "")
+    return tuple(int(n) for n in nums[:3]) + (0,) * (3 - len(nums[:3]))
+
+
+def _update_state(**changes):
+    try:
+        with open(UPDATE_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+    except Exception:
+        st = {}
+    if changes:
+        st.update(changes)
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(UPDATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(st, f, indent=2)
+    return st
+
+
+def update_asset_name():
+    """Which release file updates *this* installation."""
+    if not IS_FROZEN:
+        return "water_reminder.py"
+    if IS_WIN:
+        return "WaterReminder-Windows.exe"
+    if IS_MAC:
+        return "WaterReminder-macOS.dmg"
+    return f"WaterReminder-Linux-{platform.machine()}"
+
+
+def mac_app_bundle():
+    exe = os.path.abspath(sys.executable)
+    i = exe.find(".app/")
+    return exe[:i + 4] if i > 0 else None
+
+
+class Updater:
+    """Small async client for GitHub Releases using Qt networking (native TLS on every OS)."""
+
+    API = os.environ.get("WATER_REMINDER_UPDATE_URL") or f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+
+    def __init__(self):
+        self.net = QNetworkAccessManager()
+        self.latest = None   # dict: version, notes, url, assets{name: url}
+        self._busy = False
+
+    def _request(self, url):
+        req = QNetworkRequest(url if isinstance(url, QUrl) else QUrl(url))
+        req.setRawHeader(b"User-Agent", f"WaterReminder/{APP_VERSION}".encode())
+        req.setRawHeader(b"Accept", b"application/vnd.github+json, */*")
+        req.setAttribute(QNetworkRequest.RedirectPolicyAttribute, QNetworkRequest.NoLessSafeRedirectPolicy)
+        req.setTransferTimeout(60000)
+        return req
+
+    def check(self, callback):
+        """callback(info_or_None, error_or_None); info is set only when a newer version exists."""
+        reply = self.net.get(self._request(self.API))
+
+        def done():
+            reply.deleteLater()
+            if reply.error() != QNetworkReply.NoError:
+                callback(None, reply.errorString())
+                return
+            try:
+                data = json.loads(bytes(reply.readAll()).decode("utf-8"))
+                info = {
+                    "version": str(data.get("tag_name", "")).lstrip("vV"),
+                    "notes": data.get("body") or "",
+                    "url": data.get("html_url") or f"https://github.com/{UPDATE_REPO}/releases/latest",
+                    "assets": {a["name"]: a["browser_download_url"] for a in data.get("assets", [])},
+                }
+            except Exception as e:
+                callback(None, f"unexpected reply ({e})")
+                return
+            _update_state(last_check=time.time())
+            newer = _version_tuple(info["version"]) > _version_tuple(APP_VERSION)
+            self.latest = info if newer else None
+            callback(self.latest, None)
+        reply.finished.connect(done)
+
+    def download(self, url, path, progress, finished):
+        reply = self.net.get(self._request(url))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fh = open(path + ".part", "wb")
+        reply.readyRead.connect(lambda: fh.write(bytes(reply.readAll())))
+        reply.downloadProgress.connect(lambda got, total: progress(got, total))
+
+        def done():
+            fh.write(bytes(reply.readAll()))
+            fh.close()
+            reply.deleteLater()
+            if reply.error() != QNetworkReply.NoError:
+                finished(reply.errorString())
+                return
+            os.replace(path + ".part", path)
+            finished(None)
+        reply.finished.connect(done)
+        return reply
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def apply_update(path, app):
+    """Install the downloaded file and restart. Returns an error string, or None (app is quitting)."""
+    if not IS_FROZEN:
+        installed = os.path.join(APP_DIR, "water_reminder.py")
+        if os.path.abspath(__file__) != os.path.abspath(installed):
+            return ("You're running Water Reminder from its source folder. "
+                    "Update it with: git pull, then run the installer again.")
+        import py_compile
+        try:
+            py_compile.compile(path, doraise=True)
+        except Exception as e:
+            return f"The downloaded file looks broken ({e})."
+        shutil.copy2(installed, installed + ".bak")
+        shutil.copy2(path, installed)
+        spawn_detached([_gui_python(), installed, "--after-update"])
+    elif IS_MAC:
+        bundle = mac_app_bundle()
+        if not bundle:
+            return "Couldn't find the app bundle to update."
+        script = os.path.join(UPDATE_DIR, "install.sh")
+        mnt = os.path.join(UPDATE_DIR, "mnt")
+        with open(script, "w") as f:
+            f.write(f"""#!/bin/bash
+# Water Reminder self-update: swap in the new .app once the old one has quit.
+while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.3; done
+mkdir -p "{mnt}"
+hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "{mnt}" "{path}" || {{ open "{path}"; exit 1; }}
+NEW=$(ls -d "{mnt}"/*.app | head -1)
+rm -rf "{bundle}.old"
+if mv "{bundle}" "{bundle}.old" && ditto "$NEW" "{bundle}"; then
+  rm -rf "{bundle}.old"
+else
+  [ -d "{bundle}.old" ] && [ ! -d "{bundle}" ] && mv "{bundle}.old" "{bundle}"
+  hdiutil detach "{mnt}" -quiet; open "{path}"; exit 1
+fi
+hdiutil detach "{mnt}" -quiet
+open "{bundle}" --args --after-update
+""")
+        os.chmod(script, 0o755)
+        spawn_detached(["/bin/bash", script])
+    else:
+        # Windows .exe / Linux binary: the new file installs itself (see frozen_first_run)
+        if not IS_WIN:
+            os.chmod(path, 0o755)
+        spawn_detached([path, "--after-update"])
+    QTimer.singleShot(300, app.quit)
+    return None
+
+
+class UpdateDialog(QDialog):
+    def __init__(self, updater, info, app):
+        super().__init__(None, Qt.Dialog | Qt.WindowStaysOnTopHint | Qt.WindowCloseButtonHint)
+        self.updater, self.info, self.app = updater, info, app
+        self.setWindowTitle(f"{APP_NAME} – Update")
+        self.setWindowIcon(drop_icon())
+        self.setStyleSheet(APP_QSS + "QTextBrowser { background: white; border: 1px solid #d6e6fb;"
+                                     " border-radius: 10px; padding: 8px; color: #1b2b44; }"
+                                     "QProgressBar { border: 1px solid #c9dcf5; border-radius: 6px; height: 10px;"
+                                     " background: #eef5ff; text-align: center; }"
+                                     "QProgressBar::chunk { background: #1a70f0; border-radius: 5px; }")
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setMinimumWidth(480)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 18)
+        root.setSpacing(12)
+        root.addLayout(_header(f"Version {info['version']} is here!", f"You have version {APP_VERSION}."))
+        notes = QTextBrowser()
+        notes.setOpenExternalLinks(True)
+        notes.setMarkdown(info["notes"].strip() or "Improvements and fixes.")
+        notes.setMaximumHeight(220)
+        root.addWidget(notes)
+        self.status = QLabel("Updating takes a few seconds. Your history and settings are kept.", objectName="hint")
+        self.status.setWordWrap(True)
+        root.addWidget(self.status)
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(False)
+        self.bar.hide()
+        root.addWidget(self.bar)
+        btns = QHBoxLayout()
+        self.skip = QPushButton("Skip this version", objectName="flat")
+        self.skip.clicked.connect(self._skip)
+        btns.addWidget(self.skip)
+        btns.addStretch(1)
+        self.later = QPushButton("Later")
+        self.later.clicked.connect(self.reject)
+        self.go = QPushButton("Update now", objectName="primary")
+        self.go.setDefault(True)
+        self.go.clicked.connect(self._update)
+        btns.addWidget(self.later)
+        btns.addWidget(self.go)
+        root.addLayout(btns)
+
+    def _skip(self):
+        _update_state(skipped=self.info["version"])
+        self.reject()
+
+    def _fail(self, msg):
+        self.status.setText(msg)
+        self.bar.hide()
+        self.go.setEnabled(True)
+        self.go.setText("Try again")
+        self.later.setEnabled(True)
+
+    def _update(self):
+        name = update_asset_name()
+        assets = self.info["assets"]
+        if name not in assets:
+            self._fail(f"This release has no file for your system ({name}). "
+                       f"You can download it from the releases page instead.")
+            QDesktopServices.openUrl(QUrl(self.info["url"]))
+            return
+        self.go.setEnabled(False)
+        self.later.setEnabled(False)
+        self.skip.hide()
+        self.bar.show()
+        self.bar.setRange(0, 0)
+        self.status.setText("Downloading…")
+        shutil.rmtree(UPDATE_DIR, ignore_errors=True)
+        os.makedirs(UPDATE_DIR, exist_ok=True)
+        sums = os.path.join(UPDATE_DIR, "SHA256SUMS.txt")
+        target = os.path.join(UPDATE_DIR, name)
+
+        def progress(got, total):
+            if total > 0:
+                self.bar.setRange(0, 100)
+                self.bar.setValue(int(got * 100 / total))
+                self.status.setText(f"Downloading… {got / 1e6:.1f} of {total / 1e6:.1f} MB")
+
+        def got_file(err):
+            if err:
+                self._fail(f"Download failed: {err}")
+                return
+            try:
+                expected = {}
+                with open(sums, encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) == 2:
+                            expected[parts[1].lstrip("*")] = parts[0].lower()
+                if expected.get(name) != _sha256(target):
+                    self._fail("The download didn't match its checksum, so it wasn't installed. Please try again.")
+                    return
+            except OSError as e:
+                self._fail(f"Couldn't verify the download ({e}).")
+                return
+            self.status.setText("Installing… Water Reminder will restart in a moment.")
+            self.bar.setRange(0, 0)
+            err = apply_update(target, self.app)
+            if err:
+                self._fail(err)
+
+        def got_sums(err):
+            if err or "SHA256SUMS.txt" not in assets:
+                self._fail("Couldn't download the checksum file, so the update wasn't installed.")
+                return
+            self.updater.download(assets[name], target, progress, got_file)
+
+        if "SHA256SUMS.txt" not in assets:
+            self._fail("This release has no checksum file, so it can't be installed automatically.")
+            return
+        self.updater.download(assets["SHA256SUMS.txt"], sums, lambda *_: None, got_sums)
+
+
+# --------------------------------------------------------------------------- #
 # Background service: smart scheduling + tray icon
 # --------------------------------------------------------------------------- #
 class Service:
@@ -2521,7 +2816,13 @@ class Service:
         self.precise = QTimer()
         self.precise.setSingleShot(True)
         self.precise.timeout.connect(self._heartbeat)
+        self.updater = Updater()
+        self.update_dlg = None
         if not once:
+            QTimer.singleShot(90 * 1000, self._auto_check_updates)
+            self.update_timer = QTimer()
+            self.update_timer.timeout.connect(self._auto_check_updates)
+            self.update_timer.start(6 * 3600 * 1000)
             self.beat = QTimer()
             self.beat.timeout.connect(self._heartbeat)
             self.beat.start(self.HEARTBEAT_MS)
@@ -2643,8 +2944,53 @@ class Service:
             self.open_settings()
         elif cmd == "stats":
             self.open_stats()
+        elif cmd == "update":
+            self.check_updates_now()
         elif cmd == "quit":
             self.app.quit()
+
+    # -- updates -----------------------------------------------------------------
+    def _auto_check_updates(self, force=False):
+        if not load_config().get("check_updates", True):
+            return
+        last = _update_state().get("last_check", 0)
+        if not force and time.time() - last < 20 * 3600 and not self.updater.latest:
+            return
+        self.updater.check(self._on_auto_checked)
+
+    def _on_auto_checked(self, info, err):
+        self._refresh_tray()
+        if not info or info["version"] == _update_state().get("skipped"):
+            return
+        st = _update_state()
+        if st.get("prompted") == info["version"] and time.time() - st.get("prompted_at", 0) < 20 * 3600:
+            return  # asked recently: don't nag
+        cfg = load_config()
+        if self.overlay is not None or (cfg.get("respect_focus", True) and Probes.busy_reason()):
+            QTimer.singleShot(30 * 60 * 1000, lambda: self._on_auto_checked(info, None))
+            return
+        _update_state(prompted=info["version"], prompted_at=time.time())
+        if self.tray:
+            self.tray.showMessage(APP_NAME, f"Version {info['version']} is available.", drop_icon(), 6000)
+        self.show_update(info)
+
+    def check_updates_now(self):
+        def done(info, err):
+            self._refresh_tray()
+            if info:
+                self.show_update(info)
+            elif err:
+                QMessageBox.warning(None, APP_NAME, f"Couldn't check for updates:\n{err}")
+            else:
+                QMessageBox.information(None, APP_NAME, f"You're up to date ✓\n\nVersion {APP_VERSION}")
+        self.updater.check(done)
+
+    def show_update(self, info):
+        if self.update_dlg is not None and self.update_dlg.isVisible():
+            _bring_to_front(self.update_dlg)
+            return
+        self.update_dlg = UpdateDialog(self.updater, info, self.app)
+        _bring_to_front(self.update_dlg)
 
     # -- windows ---------------------------------------------------------------
     def open_settings(self):
@@ -2652,7 +2998,8 @@ class Service:
             _bring_to_front(self.settings_dlg)
             return
         self.settings_dlg = SettingsDialog(on_saved=self._settings_saved, on_preview=lambda: self._try_show(force=True),
-                                           on_stats=self.open_stats, on_quit=self.app.quit)
+                                           on_stats=self.open_stats, on_quit=self.app.quit,
+                                           on_check_updates=self.check_updates_now)
         _bring_to_front(self.settings_dlg)
 
     def open_stats(self):
@@ -2680,9 +3027,10 @@ class Service:
         self.a_stats = QAction("History & stats…", menu, triggered=self.open_stats)
         self.a_pause = QAction("Pause for 1 hour", menu, triggered=self._toggle_pause)
         self.a_settings = QAction("Settings…", menu, triggered=self.open_settings)
+        self.a_update = QAction("Check for updates…", menu, triggered=self._tray_update)
         self.a_quit = QAction("Quit Water Reminder", menu, triggered=self.app.quit)
         for a in (self.a_now, self.a_log, self.a_undo, None, self.a_today, self.a_next, None, self.a_stats,
-                  self.a_pause, self.a_settings, None, self.a_quit):
+                  self.a_pause, self.a_settings, self.a_update, None, self.a_quit):
             menu.addSeparator() if a is None else menu.addAction(a)
         menu.aboutToShow.connect(self._refresh_tray)
         self._menu = menu
@@ -2712,7 +3060,15 @@ class Service:
         self.a_next.setText(nxt)
         self.a_undo.setEnabled(st["count"] > 0)
         self.a_pause.setText("Resume reminders" if self.paused_until else "Pause for 1 hour")
+        latest = self.updater.latest
+        self.a_update.setText(f"Update to version {latest['version']}…" if latest else "Check for updates…")
         self.tray.setToolTip(f"{APP_NAME}\n{today}\n{nxt}")
+
+    def _tray_update(self):
+        if self.updater.latest:
+            self.show_update(self.updater.latest)
+        else:
+            self.check_updates_now()
 
     def _toggle_pause(self):
         if self.paused_until:
@@ -2817,7 +3173,7 @@ def do_install():
     return 0
 
 
-def frozen_first_run():
+def frozen_first_run(after_update=False):
     """Packaged app (.exe / Linux binary / .app): install itself for this user.
 
     Returns True if this process should exit (because an installed copy was started).
@@ -2866,7 +3222,7 @@ def frozen_first_run():
     create_shortcuts([target])
     cfg["autostart_configured"] = True
     save_config(cfg)
-    spawn_detached([target, "--welcome"])
+    spawn_detached([target, "--after-update" if after_update else "--welcome"])
     return True
 
 
@@ -2923,6 +3279,8 @@ def main():
     ap.add_argument("--uninstall", action="store_true", help="remove start-at-login")
     ap.add_argument("--purge", action="store_true", help="with --uninstall: also delete history/settings")
     ap.add_argument("--welcome", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--after-update", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--check-updates", action="store_true", help="check for a new version")
     args, _unknown = ap.parse_known_args()  # tolerate extra args (e.g. macOS -psn_...)
 
     if args.status:
@@ -2945,6 +3303,27 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     if IS_MAC:
         mac_hide_dock_icon()
+
+    if args.check_updates:
+        if send_command("update"):
+            return 0
+        upd = Updater()
+        keep = []
+
+        def checked(info, err):
+            if info:
+                dlg = UpdateDialog(upd, info, app)
+                dlg.finished.connect(lambda _r: QTimer.singleShot(0, app.quit))
+                keep.append(dlg)
+                _bring_to_front(dlg)
+                return
+            if err:
+                QMessageBox.warning(None, APP_NAME, f"Couldn't check for updates:\n{err}")
+            else:
+                QMessageBox.information(None, APP_NAME, f"You're up to date ✓\n\nVersion {APP_VERSION}")
+            app.quit()
+        upd.check(checked)
+        return app.exec()
 
     for flag, cmd, dialog in ((args.settings, "settings", "settings"), (args.stats, "stats", "stats")):
         if not flag:
@@ -2973,8 +3352,14 @@ def main():
         return app.exec()
 
     welcome = args.welcome
+    if args.after_update:
+        for _ in range(60):  # let the old version finish quitting
+            if not send_command("ping", timeout=300):
+                break
+            send_command("quit")
+            time.sleep(0.5)
     if IS_FROZEN:
-        r = frozen_first_run()
+        r = frozen_first_run(after_update=args.after_update)
         if r is True:
             return 0
         welcome = welcome or r == "welcome"
@@ -2990,7 +3375,15 @@ def main():
     print(f"[{APP_ID}] v{APP_VERSION} running - every {cfg['interval_minutes']} min "
           f"(quiet {cfg['quiet_hours']['start']}-{cfg['quiet_hours']['end']})", flush=True)
     svc.schedule(cfg["interval_minutes"])
-    if welcome:
+    if args.after_update:
+        print(f"[{APP_ID}] updated to v{APP_VERSION}", flush=True)
+        _update_state(skipped=None, prompted=None)
+
+        def greet():
+            svc.intro = "updated"
+            svc._try_show(force=True)
+        QTimer.singleShot(1500, greet)
+    elif welcome:
         QTimer.singleShot(1500, lambda: svc.command("welcome"))
 
     signal.signal(signal.SIGINT, lambda *_: app.quit())

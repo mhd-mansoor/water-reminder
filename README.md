@@ -13,6 +13,7 @@ An animated hydration buddy for **Windows, macOS and Linux**. Every 30 minutes, 
 - 🥤 A daily goal tracker, a celebration each time you log a glass, and undo if you clicked by mistake
 - ⚙️ A **Settings window** for the interval, goal, glass size, quiet hours, focus/away behaviour, name, sound and start-at-login
 - 🧭 A system tray / menu bar icon with Remind me now, Log a glass, History & stats, Pause and Settings
+- 🔄 **Automatic updates.** It checks for a new version once a day, shows you what's new, and updates itself with one click. Every download is checked against its SHA-256 checksum before it's installed.
 - 🪶 Low CPU use: it only animates while the reminder is on screen, and lowers its frame rate while the mascot moves slowly
 
 | Settings | History & stats |
@@ -29,7 +30,21 @@ Get the file for your system from the **[latest release](https://github.com/mhd-
 | **macOS 12+** (Apple Silicon) | `WaterReminder-macOS.dmg` | Open the .dmg and drag **Water Reminder** to **Applications**. The first time, **right-click the app → Open → Open**. |
 | **Linux** (x86-64) | `WaterReminder-Linux-x86_64` | `chmod +x WaterReminder-Linux-x86_64 && ./WaterReminder-Linux-x86_64` |
 
-The first time it runs, it installs itself for your user, turns on start-at-login and says hello. To update, download the new version and open it the same way.
+The first time it runs, it installs itself for your user, turns on start-at-login and says hello.
+
+## Updates
+
+From version 1.3.0 on, Water Reminder updates itself:
+
+- **Once a day**, it checks this repository's latest release. When there's a newer version, a window shows what's new, with **Update now**, **Later** and **Skip this version**. It never interrupts a full-screen app or a call to ask.
+- **Update now** downloads the right file for your system, checks its SHA-256 checksum, swaps it in and restarts. Your history and settings are kept.
+- **To check right away**, choose *Check for updates…* in the tray menu, use *Settings → Check for updates*, or run `water-reminder --check-updates`.
+- **To turn off the daily check**, untick *Settings → Check for updates automatically*.
+
+**Using an older version** (installed before 1.3.0)? Update once by hand, and it updates itself from then on:
+
+- **Downloaded app:** download the new file and open it. It replaces the old one.
+- **Installed from source:** `git pull`, then run `bash install.sh` (or `install.bat`) again.
 
 > The apps aren't code-signed (signing costs money), which is why Windows and macOS warn you the first time.
 
@@ -88,14 +103,22 @@ If you installed from source, you can instead run `uninstall.bat` or `bash unins
 
 ## For maintainers: publishing a release
 
-The workflow in `.github/workflows/release.yml` builds all three apps on GitHub's machines whenever you push. To publish a version, update `APP_VERSION` in `water_reminder.py`, then:
+The workflow in `.github/workflows/release.yml` builds all three apps on GitHub's machines whenever you push. To publish a version:
 
-```bash
-git tag v1.2.0
-git push origin v1.2.0
-```
+1. Raise `APP_VERSION` in `water_reminder.py`, for example to `1.3.1`.
+2. Commit and push.
+3. Tag the commit with the same number and push the tag:
 
-After about 10 minutes, the files appear on the **Releases** page. You can build locally with `python packaging/build.py`.
+   ```bash
+   git tag v1.3.1
+   git push origin v1.3.1
+   ```
+
+The tag must match `APP_VERSION`, or the release step stops.
+
+After about 10 minutes, the Releases page has the three apps, plus `water_reminder.py` (for source installs) and `SHA256SUMS.txt`. Everyone with version 1.3.0 or newer is offered the update within a day. The text you write in the release description is what they see under "What's new".
+
+You can build locally with `python packaging/build.py`.
 
 ## How it works
 
