@@ -40,7 +40,7 @@ download() {  # download <asset> -> $TMP/<asset>, verified against SHA256SUMS.tx
   local asset="$1"
   [ -f "$TMP/SHA256SUMS.txt" ] || curl -fsSL -o "$TMP/SHA256SUMS.txt" "$BASE_URL/SHA256SUMS.txt" \
     || fail "Couldn't reach GitHub. Check your internet connection."
-  say "Downloading $asset…"
+  say "Downloading ${asset}…"
   curl -fL --progress-bar -o "$TMP/$asset" "$BASE_URL/$asset" || fail "Download of $asset failed."
   local want got
   want="$(awk -v f="$asset" '$2 == f || $2 == "*"f {print $1}' "$TMP/SHA256SUMS.txt")"
